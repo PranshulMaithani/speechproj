@@ -1,0 +1,97 @@
+# ============================================================
+# Speech Classification Config — Read vs Spontaneous
+# ============================================================
+
+paths:
+  data_root: "D:/GoodProjects/Speech project"
+  spontaneous_dir: "2676"       # ALLSSTAR spontaneous speech
+  read_dir: "2677"              # ALLSSTAR read speech
+  manifest_csv: "outputs/manifest.csv"
+  features_dir: "outputs/features"
+  checkpoints_dir: "checkpoints"
+  company_data_dir: null        # Set when company data is available
+
+audio:
+  sample_rate: 16000
+  window_sec: 5.0               # Classification window size in seconds
+  hop_sec: 2.5                  # Window hop (overlap = window - hop)
+  min_speech_ratio: 0.20        # Discard windows with <20% speech (by energy)
+  vad_energy_threshold: 0.01    # RMS energy threshold for VAD
+  max_duration_sec: 120         # Skip files longer than this
+
+features:
+  n_mfcc: 13
+  n_mels: 80
+  f0_min: 75                    # Hz, min pitch for F0 extraction
+  f0_max: 500                   # Hz, max pitch for F0 extraction
+  frame_length_ms: 25
+  frame_shift_ms: 10
+
+splits:
+  train_ratio: 0.70
+  val_ratio: 0.15
+  test_ratio: 0.15
+  random_seed: 42
+
+training:
+  # XGBoost baseline
+  xgb:
+    n_estimators: 500
+    max_depth: 6
+    learning_rate: 0.05
+    subsample: 0.8
+    colsample_bytree: 0.8
+    early_stopping_rounds: 30
+
+  # Wav2Vec2 fine-tuning
+  wav2vec2:
+    model_name: "facebook/wav2vec2-base"
+    freeze_layers: 6            # Freeze first N transformer layers
+    hidden_size: 256
+    dropout: 0.3
+    batch_size: 16
+    learning_rate: 0.00002      # 2e-5
+    warmup_ratio: 0.10
+    num_epochs: 15
+    patience: 3
+    weight_decay: 0.01
+    fp16: true
+
+  # Domain adaptation (company data)
+  adaptation:
+    learning_rate: 0.000005     # 5e-6
+    num_epochs: 5
+    freeze_layers: 10           # Freeze more during adaptation
+    pseudo_label_threshold: 0.90
+
+accent_weights:
+  # Oversample South Asian accents for target population
+  HIN: 3.0
+  GUJ: 3.0
+  HEB: 1.0
+  CCT: 1.5
+  CMN: 1.5
+  CTW: 1.5
+  CSP: 1.0
+  ENG: 1.0
+  FAR: 1.0
+  FRA: 1.0
+  GER: 1.0
+  GIS: 1.0
+  GRE: 1.0
+  IND: 2.0    # Indonesian — somewhat relevant
+  JPN: 1.0
+  KOR: 1.0
+  PBR: 1.0
+  RUN: 1.0
+  RUS: 1.0
+  SHS: 1.0
+  SPA: 1.0
+  TUR: 1.0
+  VIE: 1.5
+
+inference:
+  temporal_smooth_window: 3     # Median filter window for smoothing
+  read_threshold: 0.50          # % of speaking windows classified as read → flag
+  confidence_threshold_high: 0.90
+  confidence_threshold_low: 0.70

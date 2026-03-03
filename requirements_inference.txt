@@ -1,0 +1,32 @@
+# Minimal requirements for INFERENCE ONLY (no training needed)
+# Install on the target/laptop machine:
+#   pip install -r requirements_inference.txt
+
+# Audio
+librosa>=0.10.0
+soundfile>=0.12.0
+
+# Features (for XGBoost backend)
+praat-parselmouth>=0.4.3
+scipy>=1.10.0
+
+# ML backends
+xgboost>=2.0.0
+scikit-learn>=1.3.0    # for the saved scaler
+
+# Deep learning (CPU-only — much smaller download than GPU version)
+# If you want ONNX (fastest on CPU), install onnxruntime instead and run export_onnx.py first:
+#   pip install onnxruntime
+# If you want PyTorch fallback:
+torch>=2.0.0            # CPU-only: pip install torch --index-url https://download.pytorch.org/whl/cpu
+transformers>=4.35.0
+
+# Data
+numpy>=1.24.0
+pandas>=2.0.0
+pyyaml>=6.0
+tqdm>=4.65.0
+
+# Optional: ONNX for faster CPU inference
+onnxruntime>=1.16.0     # ~7MB, much lighter than PyTorch
+onnx>=1.14.0            # Only needed to run export_onnx.py on training machine

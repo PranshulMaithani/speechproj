@@ -1,0 +1,28 @@
+# Data
+2676/
+2677/
+
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Model checkpoints (too large for git)
+checkpoints/*.pt
+checkpoints/*.onnx
+checkpoints/*.pkl
+
+# Outputs
+outputs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
