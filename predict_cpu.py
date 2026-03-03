@@ -111,16 +111,52 @@ def load_audio(path: str, sr: int = 16000, max_duration: float = 120.0) -> tuple
 # Voice Activity Detection
 # ============================================================
 
-def simple_vad(audio: np.ndarray, sr: int, energy_threshold: float = 0.01) -> np.ndarray:
-    """Energy-based VAD. Returns boolean frame-level mask."""
+def compute_global_vad_threshold(audio: np.ndarray, sr: int, energy_threshold: float = 0.01) -> float:
+    """Compute a single adaptive VAD threshold from the ENTIRE recording.
+    
+    This prevents per-window threshold collapse where a silence-only window
+    sets its own threshold near zero and classifies noise as speech.
+    """
     rms = librosa.feature.rms(y=audio, frame_length=512, hop_length=256)[0]
-
-    # Adaptive threshold: use median of non-silent frames as anchor
-    # This handles very quiet recordings (common in phone/laptop mic)
+    
+    # Absolute minimum floor: anything below this is definitely silence
+    # Even very quiet laptop recordings have speech RMS > 0.002
+    ABS_FLOOR = 0.002
+    
+    # Compute adaptive threshold from full recording statistics
     p30 = np.percentile(rms, 30)
     p70 = np.percentile(rms, 70)
-    adaptive_thresh = p30 + 0.1 * (p70 - p30)  # Low bar — biased toward detecting speech
-    dynamic_thresh = max(min(energy_threshold, adaptive_thresh), np.percentile(rms, 10))
+    p90 = np.percentile(rms, 90)
+    
+    # If the recording has actual speech, p90 >> p30 (dynamic range exists)
+    dynamic_range = p90 - p30
+    
+    if dynamic_range < 0.001:
+        # Almost no variation → entire recording is silence/noise
+        return max(energy_threshold, ABS_FLOOR)
+    
+    # Threshold = noise floor + 20% of dynamic range
+    # This separates the quiet background from actual speech
+    adaptive_thresh = p30 + 0.2 * dynamic_range
+    
+    # Enforce absolute minimum so true silence is never classified as speech
+    return max(adaptive_thresh, ABS_FLOOR)
+
+
+def simple_vad(audio: np.ndarray, sr: int, energy_threshold: float = 0.01,
+               global_threshold: float = None) -> np.ndarray:
+    """Energy-based VAD. Returns boolean frame-level mask.
+    
+    If global_threshold is provided (recommended), uses it directly.
+    Otherwise computes an adaptive threshold from this audio chunk.
+    """
+    rms = librosa.feature.rms(y=audio, frame_length=512, hop_length=256)[0]
+
+    if global_threshold is not None:
+        dynamic_thresh = global_threshold
+    else:
+        dynamic_thresh = max(energy_threshold, 0.002)
+    
     speech_mask = rms > dynamic_thresh
 
     # Smooth short gaps
@@ -140,9 +176,10 @@ def simple_vad(audio: np.ndarray, sr: int, energy_threshold: float = 0.01) -> np
     return smoothed
 
 
-def compute_speech_ratio(audio: np.ndarray, sr: int, threshold: float = 0.01) -> float:
+def compute_speech_ratio(audio: np.ndarray, sr: int, threshold: float = 0.01,
+                         global_threshold: float = None) -> float:
     """Fraction of audio that contains speech."""
-    mask = simple_vad(audio, sr, threshold)
+    mask = simple_vad(audio, sr, threshold, global_threshold=global_threshold)
     return float(mask.sum()) / max(len(mask), 1)
 
 
@@ -157,6 +194,10 @@ def window_audio(audio: np.ndarray, sr: int, cfg: dict) -> list:
     total = len(audio)
     threshold = cfg["vad_energy_threshold"]
 
+    # Compute ONE global threshold from the entire recording
+    # This prevents silence windows from setting their own near-zero threshold
+    global_thresh = compute_global_vad_threshold(audio, sr, threshold)
+
     windows = []
     start = 0
     while start < total:
@@ -168,7 +209,7 @@ def window_audio(audio: np.ndarray, sr: int, cfg: dict) -> list:
         if len(chunk) < window_samples:
             chunk = np.pad(chunk, (0, window_samples - len(chunk)))
 
-        speech_ratio = compute_speech_ratio(chunk, sr, threshold)
+        speech_ratio = compute_speech_ratio(chunk, sr, threshold, global_threshold=global_thresh)
         windows.append((chunk, start / sr, end / sr, speech_ratio))
         start += hop_samples
 
