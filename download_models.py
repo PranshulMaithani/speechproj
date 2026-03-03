@@ -18,11 +18,11 @@ def download_models(cache_dir="./models"):
     
     # List of essential files to download
     files = [
-        "speech_classifier_quant.onnx",  # Quantized ONNX (122MB) - USE THIS for CPU
-        "wav2vec2_best.pt",               # PyTorch (761MB)
-        "xgboost_baseline.json",          # XGBoost model
-        "xgboost_scaler.pkl",             # Feature scaler
-        "config.yaml",                    # Config file
+        "checkpoints/speech_classifier_quant.onnx",  # Quantized ONNX (122MB) - USE THIS for CPU
+        "checkpoints/wav2vec2_best.pt",               # PyTorch (761MB)
+        "checkpoints/xgboost_baseline.json",          # XGBoost model
+        "checkpoints/xgboost_scaler.pkl",             # Feature scaler
+        "configs/config.yaml",                        # Config file
     ]
     
     print("Files to download:")
