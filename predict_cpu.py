@@ -490,15 +490,15 @@ def format_summary_table(results: list) -> str:
 # ============================================================
 
 def find_audio_files(path: Path) -> list:
-    """Find all supported audio files in a path."""
+    """Find all supported audio files in a path (recursively searches subdirectories)."""
     AUDIO_EXTS = {".wav", ".mp3", ".m4a", ".flac", ".ogg", ".wma", ".aac", ".webm"}
     if path.is_file():
         return [str(path)]
     elif path.is_dir():
         files = []
         for ext in AUDIO_EXTS:
-            files.extend(path.glob(f"*{ext}"))
-            files.extend(path.glob(f"*{ext.upper()}"))
+            files.extend(path.rglob(f"*{ext}"))
+            files.extend(path.rglob(f"*{ext.upper()}"))
         return sorted(set(str(f) for f in files))
     return []
 
