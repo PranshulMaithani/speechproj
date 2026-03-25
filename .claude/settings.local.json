@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "WebFetch(domain:arxiv.org)",
+      "Bash(xargs ls:*)",
+      "WebFetch(domain:link.springer.com)",
+      "WebFetch(domain:ar5iv.labs.arxiv.org)",
+      "WebFetch(domain:www.sciencedirect.com)",
+      "WebFetch(domain:www.researchgate.net)",
+      "Bash(cd:*)"
+    ]
+  }
+}

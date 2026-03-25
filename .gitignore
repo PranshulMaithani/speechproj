@@ -1,0 +1,46 @@
+# Data
+2676/
+2677/
+data/
+old/
+
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Model checkpoints (too large for git)
+checkpoints/*.pt
+checkpoints/*.onnx
+checkpoints/*.pkl
+checkpoints/old_wav2vec2/
+checkpoints/*_history.json
+checkpoints/*_results.json
+checkpoints/*_train.log
+
+# Model checkpoints and artifacts (global)
+**/checkpoints/**
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.safetensors
+*.bin
+*.h5
+*.pb
+*.pkl
+
+# Outputs
+outputs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
