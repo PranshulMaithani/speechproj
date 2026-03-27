@@ -21,9 +21,12 @@ checkpoints/old_wav2vec2/
 checkpoints/*_history.json
 checkpoints/*_results.json
 checkpoints/*_train.log
+checkpoints/*
+
 
 # Model checkpoints and artifacts (global)
 **/checkpoints/**
+*.onnx.data
 *.pt
 *.pth
 *.ckpt

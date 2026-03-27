@@ -1,0 +1,7 @@
+{
+  "test_accuracy": 0.9711,
+  "test_f1": 0.9784,
+  "best_val_f1": 0.9764,
+  "best_epoch": 3,
+  "read_threshold": 0.65
+}
