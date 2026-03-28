@@ -98,17 +98,11 @@ def build_manifest(audio_root, labels_path, output_path):
     files_df = scan_audio_folders(audio_root)
     labels_df = load_labels(labels_path)
 
-    # Join on filename
-    manifest = files_df.merge(labels_df, on="filename", how="left")
+    # Join on filename — only keep files that exist in the labels CSV
+    manifest = files_df.merge(labels_df, on="filename", how="inner")
 
-    labeled = manifest["label_int"].notna().sum()
-    unlabeled = manifest["label_int"].isna().sum()
-    print(f"\nManifest: {len(manifest)} files ({labeled} labeled, {unlabeled} unlabeled)")
-
-    if unlabeled > 0:
-        print(f"  WARNING: {unlabeled} files have no matching label")
-        unmatched = manifest[manifest["label_int"].isna()]["filename"].head(5).tolist()
-        print(f"  Examples: {unmatched}")
+    skipped = len(files_df) - len(manifest)
+    print(f"\nManifest: {len(manifest)} labeled files (skipped {skipped} unlabeled)")
 
     manifest.to_csv(output_path, index=False)
     print(f"\nSaved: {output_path}")
