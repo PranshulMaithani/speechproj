@@ -1,11 +1,14 @@
-# Read vs Spontaneous Speech Classifier — Full Project Summary
+# Cheating Detection in Speech — Full Project Summary
 # For Claude Code Context
+# Updated: 2026-03-27
 
 ---
 
 ## Project Goal
 
-Automatically detect whether a speaker is reading from a prepared script or speaking spontaneously during a company assessment/interview. Flagged as "cheating" if reading. Must run on a CPU-only company laptop.
+Detect when exam candidates use outside help (reading from GPT, articles, pre-written notes) vs genuinely thinking and answering. This is a cheating detection problem, NOT just "read vs spontaneous." Must run on CPU-only company laptop for inference.
+
+**Key insight:** No single approach works. Acoustic-only models fail at ~45-62% precision on real data. Multi-signal fusion (acoustic + text + pause analysis) is required.
 
 ---
 
@@ -13,30 +16,30 @@ Automatically detect whether a speaker is reading from a prepared script or spea
 
 ```
 Speech project/
-├── src/
-│   ├── data/
-│   │   ├── dataset.py              # SpeechWindowDataset, build_accent_sampler
-│   │   └── audio_utils.py          # load_audio, window_audio, compute_speech_ratio
-│   └── models/
-│       ├── train_wav2vec2_5sec.py  # Wav2Vec2 5sec training
-│       ├── train_wav2vec2_7sec.py  # Wav2Vec2 7.5sec training
-│       ├── train_wav2vec2_10sec.py # Wav2Vec2 10sec training
-│       ├── train_wavLM_5sec.py     # WavLM-Base+ training (uses WavLMModel not Wav2Vec2Model)
-│       └── train_whisper_cls.py    # Whisper Medium + MLP head training
-├── configs/
-│   └── config.yaml                 # Main config
-├── checkpoints/                    # All saved models
-├── outputs/                        # Manifests, predictions, results
-├── data/
-│   ├── read/                       # GigaSpeech audiobook clips (1-min each)
-│   └── spontaneous/                # GigaSpeech podcast clips (1-min each)
-├── predict_cpu.py                  # Main CPU inference script (self-contained)
-├── export_onnx.py                  # Wav2Vec2/WavLM ONNX export
-├── export_whisper_onnx.py          # Whisper ONNX export (separate script)
-├── download_datasets.py            # Downloads GigaSpeech clips
-├── check_and_balance_manifest.py   # Fixes AllStar durations, checks window balance
-├── upload_hf.py                    # Uploads models to HuggingFace
-└── check_onnx.py                   # Verifies ONNX model input shape
+├── old/                              # Previous approach (acoustic-only)
+│   ├── src/data/                     # Dataset, audio_utils (still used by new scripts)
+│   ├── src/models/                   # Old training scripts (wav2vec2, wavlm, whisper, xgboost)
+│   ├── configs/config.yaml           # Main config
+│   ├── outputs/manifest_expanded.csv # Training manifest (ALLSSTAR + GigaSpeech)
+│   ├── predict_cpu.py                # Old 2-neuron CPU inference
+│   ├── export_onnx.py                # Old ONNX export
+│   └── upload_to_huggingface.py      # Old HF upload
+│
+├── train_biased_wav2vec2.py          # NEW: Single-neuron biased wav2vec2 trainer
+├── export_biased_onnx.py             # NEW: ONNX export for biased model
+├── eval_biased.py                    # NEW: Eval script (PyTorch + ONNX backends)
+├── upload_biased_hf.py               # NEW: Upload biased model to HF
+├── checkpoints_biased/               # NEW: Biased model checkpoints + ONNX
+│
+├── companylaptop/                    # Scripts for company laptop (CPU inference)
+│   ├── predict_biased.py             # NEW: Self-contained biased inference
+│   └── approach1/                    # Previous text+acoustic approach
+│
+├── RESEARCH_PREPARED_SPEECH_DETECTION.md  # Comprehensive research document
+├── FRESH_START_GUIDE.md              # Problem reframing and approach guide
+├── 2676/                             # ALLSSTAR spontaneous speech
+├── 2677/                             # ALLSSTAR read speech
+└── venv/                             # Python virtual environment
 ```
 
 ---
@@ -348,30 +351,43 @@ JSON output with segments + window_predictions
 
 ---
 
-## What Needs to Happen Next
+## What Needs to Happen Next (Updated 2026-03-27)
 
-### Immediate
-1. Evaluate expanded Wav2Vec2 on company data — does GigaSpeech help?
-2. Evaluate Whisper Medium on company data once training finishes
-3. Get senior timestamp labels (when does reading start/stop in each file)
-4. Change evaluation to segment-level, not file-level
+### Phase 1: Multi-Signal Pipeline (Priority — build on personal laptop)
+1. Install CrisperWhisper (nyrahealth/CrisperWhisper) and test on sample audio
+2. Build text feature extractor: disfluency rate, TTR/MATTR, complex word rate, self-reference rate, hedging, discourse markers
+3. Build pause feature extractor: pause-before-content-word ratio (using word timestamps + spaCy POS), mid-phrase pause rate, pause duration distribution
+4. Combine features → train XGBoost on ALLSSTAR data
+5. Expected: 78-88% precision with text+pause features
 
-### Manager meeting case (staging access)
-Experiment sequence to present:
-1. AllStar only → 94.1%/76.1% on concentrated data
-2. Expanded data (+ GigaSpeech) → TBD (probably similar)
-3. Whisper MLP → TBD
-4. Evidence: "More general data doesn't fix it. Company-specific fine-tuning is the only remaining lever."
+### Phase 2: Company Data Evaluation
+1. Run CrisperWhisper + feature extraction on company files
+2. Train/eval XGBoost on company labeled data
+3. Error analysis — which cheating patterns does each signal catch?
+4. Tune thresholds per-signal and at fusion level
 
-### After staging access
-- Fine-tune WavLM-Base+ on company boundary cases (hesitant readers + fluent spontaneous)
-- Target: 40-50 confirmed files per class from company data
-- Mix ratio: 1 company per 2-3 AllStar in fine-tuning set
-- Lower LR (5e-6), more frozen layers (8), fewer epochs (5)
-- Re-enable Silero VAD after fine-tuning — will then help not hurt
+### Phase 3: Refinement
+1. Add F0/prosodic features (openSMILE eGeMAPS)
+2. Add transcript perplexity (GPT-2) for AI-generated text detection
+3. Fine-tune acoustic model on company data
+4. Calibrate "uncertain" class for human review escalation
 
-### Long term architecture
-Multi-scale WavLM (5s + 10s + 15s) with scale attention fusion + prosodic features concatenated at classifier. See full_project_report.md for complete code.
+### Architecture Target
+```
+Audio → CrisperWhisper → Transcript + Word Timestamps
+  |                           |
+  v                           v
+Acoustic model          Text features + Pause features
+(biased wav2vec2)       (disfluency, TTR, pause placement)
+  |                           |
+  +------ Feature Vector -----+
+              |
+         XGBoost/LightGBM
+              |
+    [Cheating / Genuine / Uncertain]
+```
+
+See RESEARCH_PREPARED_SPEECH_DETECTION.md for full details, benchmarks, and references.
 
 ---
 
