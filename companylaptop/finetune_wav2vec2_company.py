@@ -265,10 +265,39 @@ def main():
     if args.checkpoint and os.path.exists(args.checkpoint):
         print(f"Loading pretrained checkpoint: {args.checkpoint}")
         ck = torch.load(args.checkpoint, map_location=device, weights_only=False)
-        # Load encoder + classifier weights from checkpoint
         state = ck["model_state_dict"] if "model_state_dict" in ck else ck
-        model.load_state_dict(state, strict=False)
+
+        # Debug: compare keys
+        model_keys = set(model.state_dict().keys())
+        ckpt_keys = set(state.keys())
+        matched = model_keys & ckpt_keys
+        missing = model_keys - ckpt_keys
+        unexpected = ckpt_keys - model_keys
+        print(f"  Checkpoint keys: {len(ckpt_keys)}")
+        print(f"  Model keys:      {len(model_keys)}")
+        print(f"  Matched:         {len(matched)}")
+        print(f"  Missing (not in checkpoint): {len(missing)}")
+        print(f"  Unexpected (not in model):   {len(unexpected)}")
+        if missing:
+            print(f"  Missing keys (first 10): {list(missing)[:10]}")
+        if unexpected:
+            print(f"  Unexpected keys (first 10): {list(unexpected)[:10]}")
+
+        if len(matched) == 0:
+            print("\n  *** WARNING: ZERO keys matched! Checkpoint is incompatible. ***")
+            print("  The model will train from scratch (facebook/wav2vec2-base weights only).")
+        elif len(matched) < len(model_keys) * 0.5:
+            print(f"\n  *** WARNING: Only {len(matched)}/{len(model_keys)} keys matched. Partial load. ***")
+
+        result = model.load_state_dict(state, strict=False)
+        print(f"  load_state_dict result: missing={len(result.missing_keys)}, unexpected={len(result.unexpected_keys)}")
         print(f"  Loaded (epoch={ck.get('epoch', '?')}, val_f1={ck.get('val_f1', '?')})")
+    else:
+        if args.checkpoint:
+            print(f"\n  *** WARNING: Checkpoint not found: {args.checkpoint} ***")
+            print(f"  Training from scratch (facebook/wav2vec2-base only)!")
+        else:
+            print(f"\n  No checkpoint provided — training from scratch (facebook/wav2vec2-base only)")
 
     # Class balancing
     train_labels = [train_dataset.df.iloc[fi]["label_int"] for fi, _ in train_dataset.window_index]
