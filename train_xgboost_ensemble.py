@@ -55,7 +55,11 @@ PROSODIC_FEATURES = [
     "energy_mean", "energy_std", "speaking_rate_std",
 ]
 
-ALL_FEATURES = TEXT_FEATURES + PAUSE_FEATURES + PROSODIC_FEATURES
+WAV2VEC2_FEATURES = [
+    "wav2vec2_read_ratio", "wav2vec2_mean_p_read", "wav2vec2_max_p_read",
+]
+
+ALL_FEATURES = TEXT_FEATURES + PAUSE_FEATURES + PROSODIC_FEATURES + WAV2VEC2_FEATURES
 
 
 def load_and_combine_features(feature_paths, acoustic_path=None):
@@ -89,7 +93,7 @@ def load_and_combine_features(feature_paths, acoustic_path=None):
 def get_available_features(df):
     """Return feature columns that exist and have non-zero variance."""
     available = []
-    for col in ALL_FEATURES + ["acoustic_p_read"]:
+    for col in ALL_FEATURES:
         if col in df.columns:
             vals = df[col].fillna(0)
             if vals.std() > 1e-8:
@@ -272,6 +276,7 @@ def main():
     parser.add_argument("--features", nargs="+", required=True, help="Feature CSV files")
     parser.add_argument("--acoustic-scores", type=str, help="Acoustic model scores CSV")
     parser.add_argument("--output-dir", type=str, default=str(OUTPUT_DIR))
+    parser.add_argument("--no-wav2vec2", action="store_true", help="Exclude wav2vec2 features (text-only model)")
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
@@ -281,9 +286,12 @@ def main():
 
     # Get available features
     feature_cols = get_available_features(df)
+    if args.no_wav2vec2:
+        feature_cols = [c for c in feature_cols if c not in WAV2VEC2_FEATURES]
+        print("\n** Excluding wav2vec2 features (text-only mode) **")
     print(f"\nUsing {len(feature_cols)} features:")
     for col in feature_cols:
-        group = "TEXT" if col in TEXT_FEATURES else "PAUSE" if col in PAUSE_FEATURES else "PROSODIC" if col in PROSODIC_FEATURES else "ACOUSTIC"
+        group = "TEXT" if col in TEXT_FEATURES else "PAUSE" if col in PAUSE_FEATURES else "PROSODIC" if col in PROSODIC_FEATURES else "WAV2VEC2" if col in WAV2VEC2_FEATURES else "OTHER"
         print(f"  [{group:8s}] {col}")
 
     # Train
