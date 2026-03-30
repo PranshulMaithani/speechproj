@@ -116,33 +116,7 @@ scp -i your-key.pem companylaptop/ec2_training/*.py ubuntu@<public-ip>:~/trainin
 
 ## 5. Download Datasets
 
-### 5a. ALLSSTAR (from HuggingFace — you need to upload it first)
-
-Before running EC2, upload ALLSSTAR from your local machine:
-```bash
-# FROM YOUR LOCAL MACHINE:
-# Install huggingface CLI if needed: pip install huggingface_hub
-# Login: huggingface-cli login
-
-# Upload ALLSSTAR audio + manifest
-huggingface-cli upload Pransfrance/speechproj-allsstar 2676/ allsstar/2676/ --repo-type dataset
-huggingface-cli upload Pransfrance/speechproj-allsstar 2677/ allsstar/2677/ --repo-type dataset
-huggingface-cli upload Pransfrance/speechproj-allsstar old/outputs/manifest_expanded.csv manifest.csv --repo-type dataset
-```
-
-Then on EC2:
-```bash
-cd ~/training
-
-# Login to HuggingFace
-huggingface-cli login
-# Paste your token
-
-# Download ALLSSTAR
-python download_allsstar.py
-```
-
-### 5b. Meta Casual Conversations v2 (CCv2)
+### 5a. Meta Casual Conversations v2 (CCv2)
 
 CCv2 has **both scripted (read) and unscripted (spontaneous)** video recordings.
 Files inside zips are named: `{participant_id}_{language}_{scripted|nonscripted}_{index}.mp4`

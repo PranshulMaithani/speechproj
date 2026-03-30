@@ -174,26 +174,14 @@ def build_unified_manifest():
 
     Balancing logic:
       1. Casual Conversations: use EQUAL scripted and unscripted
-      2. Total spontaneous = AMI + Casual unscripted + ALLSSTAR spontaneous
-      3. Total read = LibriSpeech + Casual scripted + ALLSSTAR read
+      2. Total spontaneous = AMI + Casual unscripted
+      3. Total read = LibriSpeech + Casual scripted
       4. Cap LibriSpeech so total read ≈ total spontaneous
     """
     from sklearn.model_selection import train_test_split
 
     # ── Load all sources ─────────────────────────────────────
     sources = {}
-
-    # ALLSSTAR
-    allsstar_manifest = Path("datasets/allsstar/manifest_local.csv")
-    if allsstar_manifest.exists():
-        df = pd.read_csv(allsstar_manifest)
-        df = df[df["filepath"].apply(os.path.exists)]
-        df = df[["filepath", "filename", "label", "label_int"]].copy()
-        df["source"] = "allsstar"
-        sources["allsstar"] = df
-        print(f"ALLSSTAR:    {len(df)} ({(df.label_int==1).sum()} read, {(df.label_int==0).sum()} spont)")
-    else:
-        print("ALLSSTAR: not found (run download_allsstar.py first)")
 
     # LibriSpeech
     libri_manifest = LIBRI_DIR / "manifest.csv"
@@ -244,12 +232,8 @@ def build_unified_manifest():
     if "ami" in sources:
         n_spont += len(sources["ami"])
     n_spont += len(casual_unscripted)
-    if "allsstar" in sources:
-        n_spont += (sources["allsstar"]["label_int"] == 0).sum()
 
     n_read_other = len(casual_scripted)
-    if "allsstar" in sources:
-        n_read_other += (sources["allsstar"]["label_int"] == 1).sum()
 
     # Cap LibriSpeech so total read ≈ total spontaneous
     target_libri = max(0, n_spont - n_read_other)
