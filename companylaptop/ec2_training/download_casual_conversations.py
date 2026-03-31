@@ -254,7 +254,7 @@ def convert_mp4s(mp4_dir, max_per_class=None):
                 continue
 
         duration = get_duration(wav_path)
-        if duration < 3.0 or duration > 120.0:
+        if duration < 3.0:
             wav_path.unlink(missing_ok=True)
             skipped_duration += 1
             continue
@@ -266,7 +266,7 @@ def convert_mp4s(mp4_dir, max_per_class=None):
     if skipped_limit:
         log(f"Skipped (class limit reached): {skipped_limit}", indent=2)
     if skipped_duration:
-        log(f"Skipped (bad duration <3s or >120s): {skipped_duration}", indent=2)
+        log(f"Skipped (too short <3s): {skipped_duration}", indent=2)
     if skipped_ffmpeg:
         log(f"Skipped (ffmpeg failed): {skipped_ffmpeg}", indent=2)
     log(f"Total on disk: {s} scripted, {n} nonscripted", indent=2)

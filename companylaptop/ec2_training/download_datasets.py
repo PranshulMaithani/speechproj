@@ -139,7 +139,7 @@ def download_ami():
             audio = item["audio"]["array"]
             duration = len(audio) / SR
 
-            if duration < 3.0 or duration > 60.0:
+            if duration < 3.0:
                 continue
 
             fname = f"ami_{i:06d}.wav"
