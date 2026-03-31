@@ -209,7 +209,8 @@ def evaluate(model, loader, criterion, device):
 # ── Main ────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(description="Train wav2vec2 on combined datasets")
-    parser.add_argument("--manifest", type=str, default="data/manifest_unified.csv")
+    _script_dir = str(Path(__file__).resolve().parent)
+    parser.add_argument("--manifest", type=str, default=os.path.join(_script_dir, "data", "manifest_unified.csv"))
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--lr", type=float, default=1e-5)

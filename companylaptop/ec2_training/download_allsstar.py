@@ -12,7 +12,8 @@ from pathlib import Path
 from huggingface_hub import snapshot_download
 
 REPO_ID = "Pransfrance/speechproj-allsstar"
-OUT_DIR = Path("data/allsstar")
+_SCRIPT_DIR = Path(__file__).resolve().parent
+OUT_DIR = _SCRIPT_DIR / "data" / "allsstar"
 
 
 def main():

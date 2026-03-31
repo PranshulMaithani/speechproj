@@ -34,10 +34,12 @@ from tqdm import tqdm
 
 SR = 16000  # Target sample rate
 
+# Use absolute paths to avoid cwd issues
+_SCRIPT_DIR = Path(__file__).resolve().parent
 
 # ── LibriSpeech ──────────────────────────────────────────────
 LIBRI_URL = "https://www.openslr.org/resources/12/train-clean-100.tar.gz"
-LIBRI_DIR = Path("data/librispeech")
+LIBRI_DIR = _SCRIPT_DIR / "data" / "librispeech"
 
 
 class _DownloadProgress:
@@ -107,7 +109,7 @@ def download_librispeech():
 
 
 # ── AMI ──────────────────────────────────────────────────────
-AMI_DIR = Path("data/ami")
+AMI_DIR = _SCRIPT_DIR / "data" / "ami"
 
 
 def download_ami():
@@ -167,7 +169,7 @@ def download_ami():
 
 
 # ── Casual Conversations ─────────────────────────────────────
-CASUAL_DIR = Path("data/casual_conversations")
+CASUAL_DIR = _SCRIPT_DIR / "data" / "casual_conversations"
 
 
 # ── Build unified manifest (balanced) ────────────────────────
@@ -309,7 +311,7 @@ def build_unified_manifest():
     test_df["split"] = "test"
     final = pd.concat([train_df, val_df, test_df], ignore_index=True)
 
-    manifest_path = Path("data/manifest_unified.csv")
+    manifest_path = _SCRIPT_DIR / "data" / "manifest_unified.csv"
     final.to_csv(manifest_path, index=False)
 
     print(f"\nTrain: {len(train_df)}, Val: {len(val_df)}, Test: {len(test_df)}")
