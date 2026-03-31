@@ -76,8 +76,8 @@ def parse_links_file(links_path):
             if len(parts) >= 2:
                 fname = parts[0].strip()
                 url = parts[1].strip()
-                # Only CCv2_part_*.zip (videos). Skip CCv2_frames_part_* (images only)
-                if fname.startswith("CCv2_part_") and fname.endswith(".zip"):
+                # CCv2_part_*.zip (videos) + CCv2_samples.zip. Skip CCv2_frames_part_* (images only)
+                if fname == "CCv2_samples.zip" or (fname.startswith("CCv2_part_") and fname.endswith(".zip")):
                     links[fname] = url
     return links
 
@@ -424,11 +424,13 @@ def main():
             log(f"  CCv2_part_1.zip\\thttps://scontent.xx.fbcdn.net/...")
             return
 
-        # Sort by part number
-        def part_num(name):
+        # Sort: CCv2_samples.zip first (for verification), then by part number
+        def sort_key(name):
+            if name == "CCv2_samples.zip":
+                return -1  # always first
             m = re.search(r"part_(\d+)", name)
             return int(m.group(1)) if m else 0
-        sorted_links = sorted(links.items(), key=lambda x: part_num(x[0]))
+        sorted_links = sorted(links.items(), key=lambda x: sort_key(x[0]))
 
         log(f"")
         log(f"Found {len(sorted_links)} CCv2_part links in {args.links}")
