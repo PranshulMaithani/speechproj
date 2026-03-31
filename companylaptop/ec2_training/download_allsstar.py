@@ -12,7 +12,7 @@ from pathlib import Path
 from huggingface_hub import snapshot_download
 
 REPO_ID = "Pransfrance/speechproj-allsstar"
-OUT_DIR = Path("datasets/allsstar")
+OUT_DIR = Path("data/allsstar")
 
 
 def main():
@@ -34,7 +34,7 @@ def main():
 
         # Original paths are Windows absolute — remap to local
         # Original: D:\GoodProjects\Speech project\2676\ALL_CCT_ENG_QNA\file.wav
-        # Local:    datasets/allsstar/allsstar/2676/ALL_CCT_ENG_QNA/file.wav
+        # Local:    data/allsstar/allsstar/2676/ALL_CCT_ENG_QNA/file.wav
         def remap_path(fp):
             fp = str(fp).replace("\\", "/")
             # Extract from the 2676/ or 2677/ part onwards

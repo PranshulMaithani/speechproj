@@ -220,21 +220,20 @@ python export_onnx.py
 
 ---
 
-## 8. Upload Results
+## 8. Upload Results to S3
 
 ```bash
-# Upload trained model to HuggingFace
-huggingface-cli upload Pransfrance/speechproj-models \
-    checkpoints/wav2vec2_trained_quant.onnx combined_v2/wav2vec2_combined_quant.onnx
+# Make sure AWS CLI is configured (the EC2 instance role should have S3 access,
+# or run: aws configure)
 
-huggingface-cli upload Pransfrance/speechproj-models \
-    checkpoints/wav2vec2_best.pt combined_v2/wav2vec2_combined_best.pt
+# Upload all checkpoints to S3
+python upload_model.py --bucket YOUR_BUCKET_NAME
 
-huggingface-cli upload Pransfrance/speechproj-models \
-    checkpoints/results.json combined_v2/results.json
-
-huggingface-cli upload Pransfrance/speechproj-models \
-    checkpoints/history.json combined_v2/history.json
+# Or manually:
+aws s3 cp checkpoints/wav2vec2_trained_quant.onnx s3://YOUR_BUCKET_NAME/combined_v2/
+aws s3 cp checkpoints/wav2vec2_best.pt s3://YOUR_BUCKET_NAME/combined_v2/
+aws s3 cp checkpoints/results.json s3://YOUR_BUCKET_NAME/combined_v2/
+aws s3 cp checkpoints/history.json s3://YOUR_BUCKET_NAME/combined_v2/
 ```
 
 ---
@@ -243,9 +242,8 @@ huggingface-cli upload Pransfrance/speechproj-models \
 
 On your company laptop:
 ```bash
-cd companylaptop/
-huggingface-cli download Pransfrance/speechproj-models \
-    combined_v2/wav2vec2_combined_quant.onnx --local-dir .
+aws s3 cp s3://YOUR_BUCKET_NAME/combined_v2/wav2vec2_trained_quant.onnx .
+aws s3 cp s3://YOUR_BUCKET_NAME/combined_v2/results.json .
 ```
 
 Then update `eval_and_finetune.ipynb` to point to the new model.
@@ -267,28 +265,26 @@ aws ec2 stop-instances --instance-ids <instance-id>
 ## Quick Reference — Full Flow
 
 ```bash
-# 1. SSH in + tmux
+# 1. SSH in + screen (survives disconnects)
 ssh -i key.pem ubuntu@<ip>
-tmux new -s train
+screen -S train
 
 # 2. Activate env
-source ~/wav2vec2_env/bin/activate
-cd ~/training
+source ~/venv/bin/activate
+cd ~/training/companylaptop/ec2_training
 
-# 3. Download data (first time only)
-python download_allsstar.py                                          # ~9 GB from HuggingFace
-python download_casual_conversations.py --links ccv2_links.txt       # CCv2 English audio
-python download_datasets.py                                          # LibriSpeech + AMI
-python download_datasets.py --manifest-only                          # build balanced manifest
+# 3. Download data + train + export (chain all)
+python download_casual_conversations.py --links ccv2_links.txt --max-per-class 5000 && \
+python download_datasets.py && \
+python train.py && \
+python export_onnx.py && \
+echo "DONE"
 
-# 4. Train
-python train.py
+# 4. Detach screen: Ctrl+A, D
+# 5. Reconnect later: screen -r train
 
-# 5. Export
-python export_onnx.py
-
-# 6. Upload
-huggingface-cli upload Pransfrance/speechproj-models checkpoints/ combined_v2/
+# 6. Upload to S3
+python upload_model.py --bucket YOUR_BUCKET_NAME
 
 # 7. STOP THE INSTANCE
 ```
@@ -299,7 +295,7 @@ huggingface-cli upload Pransfrance/speechproj-models checkpoints/ combined_v2/
 |---------|-----|
 | `CUDA out of memory` | Reduce `--batch-size` (try 4) |
 | `nvidia-smi` not found | Drivers not installed, run step 2 |
-| SSH disconnected during training | Use `tmux attach -t train` to reconnect |
+| SSH disconnected during training | Use `screen -r train` to reconnect |
 | Slow download | Check instance region, use `aria2c` for parallel downloads |
 | `libsndfile` error | `sudo apt install libsndfile1` |
 | `RuntimeError: cuDNN not found` | `sudo apt install libcudnn8` |

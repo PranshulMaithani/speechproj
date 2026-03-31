@@ -38,7 +38,7 @@ import pandas as pd
 from tqdm import tqdm
 
 SR = 16000
-OUT_DIR = Path("datasets/casual_conversations")
+OUT_DIR = Path("data/casual_conversations")
 AUDIO_DIR = OUT_DIR / "audio_scripted"
 AUDIO_DIR_UNSCRIPTED = OUT_DIR / "audio_nonscripted"
 MP4_TEMP = OUT_DIR / "mp4_temp"
@@ -64,8 +64,8 @@ def parse_links_file(links_path):
             if len(parts) >= 2:
                 fname = parts[0].strip()
                 url = parts[1].strip()
-                # Only want CCv2_part_*.zip (not frames, not annotations, not samples)
-                if fname.startswith("CCv2_part_") and fname.endswith(".zip"):
+                # Accept CCv2_part_*.zip and CCv2_frames_part_*.zip
+                if (fname.startswith("CCv2_part_") or fname.startswith("CCv2_frames_part_")) and fname.endswith(".zip"):
                     links[fname] = url
     return links
 
@@ -145,84 +145,81 @@ def get_duration(wav_path):
             return 0
 
 
-def process_mp4s(mp4_dir, max_per_class=None):
-    """Convert English MP4s to WAV and build manifest."""
+def convert_mp4s(mp4_dir, max_per_class=None):
+    """Convert English MP4s to WAV. Does NOT build manifest (that's separate)."""
     AUDIO_DIR.mkdir(parents=True, exist_ok=True)
     AUDIO_DIR_UNSCRIPTED.mkdir(parents=True, exist_ok=True)
 
     mp4_files = sorted(Path(mp4_dir).glob("*.mp4"))
-    print(f"\nFound {len(mp4_files)} MP4 files to process")
+    if not mp4_files:
+        return
+    print(f"  Converting {len(mp4_files)} MP4 files to WAV...")
 
-    rows = []
-    scripted_count = 0
-    nonscripted_count = 0
-
-    for mp4 in tqdm(mp4_files, desc="Converting MP4 -> WAV"):
+    for mp4 in tqdm(mp4_files, desc="  MP4 -> WAV"):
         match = ENGLISH_PATTERN.match(mp4.name)
         if not match:
             continue
 
-        participant_id = match.group(1)
-        script_type = match.group(2)  # "scripted" or "nonscripted"
-        index = match.group(3)
+        script_type = match.group(2)
 
-        # Check max per class
+        # Check max per class (count existing WAVs on disk)
         if max_per_class:
-            if script_type == "scripted" and scripted_count >= max_per_class:
+            if script_type == "scripted" and len(list(AUDIO_DIR.glob("*.wav"))) >= max_per_class:
                 continue
-            if script_type == "nonscripted" and nonscripted_count >= max_per_class:
+            if script_type == "nonscripted" and len(list(AUDIO_DIR_UNSCRIPTED.glob("*.wav"))) >= max_per_class:
                 continue
 
-        # Output WAV path
-        if script_type == "scripted":
-            wav_dir = AUDIO_DIR
-            label = "read"
-            label_int = 1
-        else:
-            wav_dir = AUDIO_DIR_UNSCRIPTED
-            label = "spontaneous"
-            label_int = 0
+        wav_dir = AUDIO_DIR if script_type == "scripted" else AUDIO_DIR_UNSCRIPTED
+        wav_path = wav_dir / (mp4.stem + ".wav")
 
-        wav_name = mp4.stem + ".wav"
-        wav_path = wav_dir / wav_name
-
-        # Convert if not already done
         if not wav_path.exists():
             if not mp4_to_wav(mp4, wav_path):
                 continue
 
-        # Check duration
+        # Check duration — remove bad files
         duration = get_duration(wav_path)
         if duration < 3.0 or duration > 120.0:
             wav_path.unlink(missing_ok=True)
+
+
+def build_ccv2_manifest():
+    """Build manifest from all existing WAV files on disk."""
+    rows = []
+    for wav_dir, script_type, label, label_int in [
+        (AUDIO_DIR, "scripted", "read", 1),
+        (AUDIO_DIR_UNSCRIPTED, "nonscripted", "spontaneous", 0),
+    ]:
+        if not wav_dir.exists():
             continue
-
-        if script_type == "scripted":
-            scripted_count += 1
-        else:
-            nonscripted_count += 1
-
-        rows.append({
-            "filepath": str(wav_path.resolve()),
-            "filename": wav_name,
-            "source": "casual_conversations",
-            "label": label,
-            "label_int": label_int,
-            "script_type": script_type,
-            "duration_sec": round(duration, 2),
-            "speaker_id": participant_id,
-        })
+        for wav in sorted(wav_dir.glob("*.wav")):
+            match = re.match(r"(\d+)_english_", wav.name)
+            pid = match.group(1) if match else ""
+            duration = get_duration(wav)
+            if duration < 3.0:
+                continue
+            rows.append({
+                "filepath": str(wav.resolve()),
+                "filename": wav.name,
+                "source": "casual_conversations",
+                "label": label,
+                "label_int": label_int,
+                "script_type": script_type,
+                "duration_sec": round(duration, 2),
+                "speaker_id": pid,
+            })
 
     df = pd.DataFrame(rows)
     manifest_path = OUT_DIR / "manifest.csv"
     df.to_csv(manifest_path, index=False)
 
+    scripted_count = (df["label_int"] == 1).sum()
+    nonscripted_count = (df["label_int"] == 0).sum()
     print(f"\nCasual Conversations manifest: {manifest_path}")
     print(f"  Total:       {len(df)}")
     print(f"  Scripted:    {scripted_count} (label=read)")
     print(f"  Nonscripted: {nonscripted_count} (label=spontaneous)")
-    print(f"  Duration:    {df['duration_sec'].sum()/3600:.1f} hours")
-
+    if "duration_sec" in df.columns and len(df) > 0:
+        print(f"  Duration:    {df['duration_sec'].sum()/3600:.1f} hours")
     return df
 
 
@@ -262,20 +259,22 @@ def main():
 
     # Mode 1: Process already-extracted MP4s
     if args.mp4_dir:
-        process_mp4s(args.mp4_dir, args.max_per_class)
+        convert_mp4s(args.mp4_dir, args.max_per_class)
+        build_ccv2_manifest()
         return
 
     # Mode 2: Process already-downloaded zips
     if args.zip_dir:
-        zip_files = sorted(Path(args.zip_dir).glob("CCv2_part_*.zip"))
+        zip_files = sorted(list(Path(args.zip_dir).glob("CCv2_part_*.zip")) +
+                           list(Path(args.zip_dir).glob("CCv2_frames_part_*.zip")))
         print(f"Found {len(zip_files)} zip files in {args.zip_dir}")
         for zf in zip_files:
             extract_english_from_zip(zf, MP4_TEMP)
-        process_mp4s(MP4_TEMP, args.max_per_class)
-        if not args.keep_mp4s:
-            print("Cleaning up MP4 temp files...")
-            for f in MP4_TEMP.glob("*.mp4"):
-                f.unlink()
+            convert_mp4s(MP4_TEMP, args.max_per_class)
+            if not args.keep_mp4s:
+                for f in MP4_TEMP.glob("*.mp4"):
+                    f.unlink()
+        build_ccv2_manifest()
         return
 
     # Mode 3: Download from links file
@@ -307,9 +306,9 @@ def main():
         print(f"Already extracted: {len(existing_mp4s)} English MP4s")
 
         for i, (fname, url) in enumerate(sorted_links):
-            # Check if we have enough files already
-            scripted = len(list(MP4_TEMP.glob("*_english_scripted_*.mp4")))
-            nonscripted = len(list(MP4_TEMP.glob("*_english_nonscripted_*.mp4")))
+            # Check if we have enough WAV files already
+            scripted = len(list(AUDIO_DIR.glob("*.wav")))
+            nonscripted = len(list(AUDIO_DIR_UNSCRIPTED.glob("*.wav")))
             if scripted >= args.max_per_class and nonscripted >= args.max_per_class:
                 print(f"\nReached target: {scripted} scripted, {nonscripted} nonscripted. Stopping downloads.")
                 break
@@ -342,23 +341,35 @@ def main():
                 zip_path.unlink(missing_ok=True)
                 continue
 
-            # Extract English files
+            # Extract English MP4s
             extract_english_from_zip(zip_path, MP4_TEMP)
 
-            # Delete zip to save disk space
+            # Delete zip IMMEDIATELY to save disk space
             if not args.keep_zips:
                 print(f"  Deleting {fname} to save space...")
                 zip_path.unlink(missing_ok=True)
 
-        # Convert all MP4s to WAV
-        process_mp4s(MP4_TEMP, args.max_per_class)
+            # Convert MP4s to WAV IMMEDIATELY (don't accumulate)
+            convert_mp4s(MP4_TEMP, args.max_per_class)
 
-        # Cleanup MP4s
-        if not args.keep_mp4s:
-            print("\nCleaning up MP4 temp files...")
-            for f in MP4_TEMP.glob("*.mp4"):
-                f.unlink()
-            MP4_TEMP.rmdir()
+            # Delete MP4s IMMEDIATELY after conversion
+            if not args.keep_mp4s:
+                for f in MP4_TEMP.glob("*.mp4"):
+                    f.unlink()
+                print(f"  Cleaned up MP4 temp files")
+
+        # Build final manifest from all WAVs on disk
+        build_ccv2_manifest()
+
+        # Cleanup temp dirs
+        for d in [MP4_TEMP, zip_dir]:
+            if d.exists():
+                for f in d.glob("*"):
+                    f.unlink(missing_ok=True)
+                try:
+                    d.rmdir()
+                except OSError:
+                    pass
 
         return
 

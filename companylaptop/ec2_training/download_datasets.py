@@ -13,6 +13,9 @@ Usage:
     python download_datasets.py --skip-libri
     python download_datasets.py --skip-ami
     python download_datasets.py --manifest-only   # just rebuild unified manifest
+
+NOTE: Data is stored in data/ (not datasets/) to avoid shadowing
+the HuggingFace 'datasets' package import.
 """
 
 import argparse
@@ -34,7 +37,7 @@ SR = 16000  # Target sample rate
 
 # ── LibriSpeech ──────────────────────────────────────────────
 LIBRI_URL = "https://www.openslr.org/resources/12/train-clean-100.tar.gz"
-LIBRI_DIR = Path("datasets/librispeech")
+LIBRI_DIR = Path("data/librispeech")
 
 
 class _DownloadProgress:
@@ -104,7 +107,7 @@ def download_librispeech():
 
 
 # ── AMI ──────────────────────────────────────────────────────
-AMI_DIR = Path("datasets/ami")
+AMI_DIR = Path("data/ami")
 
 
 def download_ami():
@@ -164,7 +167,7 @@ def download_ami():
 
 
 # ── Casual Conversations ─────────────────────────────────────
-CASUAL_DIR = Path("datasets/casual_conversations")
+CASUAL_DIR = Path("data/casual_conversations")
 
 
 # ── Build unified manifest (balanced) ────────────────────────
@@ -172,11 +175,11 @@ def build_unified_manifest():
     """
     Combine all datasets into one balanced manifest.
 
-    Balancing logic:
+    Balancing logic (window-aware — counts 5-sec segments, not files):
       1. Casual Conversations: use EQUAL scripted and unscripted
-      2. Total spontaneous = AMI + Casual unscripted
-      3. Total read = LibriSpeech + Casual scripted
-      4. Cap LibriSpeech so total read ≈ total spontaneous
+      2. Total spontaneous windows = AMI + Casual unscripted
+      3. Total read windows = LibriSpeech + Casual scripted
+      4. Cap LibriSpeech files so total read windows ≈ total spontaneous windows
     """
     from sklearn.model_selection import train_test_split
 
@@ -227,28 +230,49 @@ def build_unified_manifest():
         casual_unscripted = casual_unscripted.sample(n=n_casual_each, random_state=42)
         print(f"\nBalanced Casual Conv: {n_casual_each} scripted + {n_casual_each} unscripted")
 
-    # ── Count spontaneous (before balancing LibriSpeech) ─────
-    n_spont = 0
-    if "ami" in sources:
-        n_spont += len(sources["ami"])
-    n_spont += len(casual_unscripted)
+    # ── Window-aware balancing (5-sec windows, not file counts) ─────
+    import librosa as _lr
 
-    n_read_other = len(casual_scripted)
+    def _estimate_windows(df):
+        total = 0
+        for _, row in df.iterrows():
+            try:
+                dur = _lr.get_duration(path=row["filepath"])
+                total += max(1, int(dur * SR) // (int(5.0 * SR)))
+            except Exception:
+                total += 1
+        return total
 
-    # Cap LibriSpeech so total read ≈ total spontaneous
-    target_libri = max(0, n_spont - n_read_other)
+    print("\nEstimating 5-sec window counts per source...")
+    w_ami = _estimate_windows(sources["ami"]) if "ami" in sources else 0
+    w_casual_unscr = _estimate_windows(casual_unscripted) if not casual_unscripted.empty else 0
+    w_casual_scr = _estimate_windows(casual_scripted) if not casual_scripted.empty else 0
+
+    total_spont_windows = w_ami + w_casual_unscr
+    target_libri_windows = max(0, total_spont_windows - w_casual_scr)
+
+    print(f"  AMI windows:              {w_ami}")
+    print(f"  Casual nonscripted windows: {w_casual_unscr}")
+    print(f"  Casual scripted windows:  {w_casual_scr}")
+    print(f"  Total spontaneous windows:{total_spont_windows}")
+    print(f"  Target LibriSpeech windows: {target_libri_windows}")
+
     if "librispeech" in sources:
         libri = sources["librispeech"]
-        if len(libri) > target_libri and target_libri > 0:
-            libri = libri.sample(n=target_libri, random_state=42)
-            sources["librispeech"] = libri
-            print(f"Capped LibriSpeech to {target_libri} (to match spontaneous count)")
-        elif target_libri == 0:
-            # Still include some LibriSpeech for diversity
+        if target_libri_windows > 0:
+            w_libri_full = _estimate_windows(libri)
+            avg_w = w_libri_full / len(libri) if len(libri) > 0 else 1
+            target_files = min(int(target_libri_windows / avg_w), len(libri))
+            if target_files < len(libri):
+                libri = libri.sample(n=target_files, random_state=42)
+                print(f"  Capped LibriSpeech to {target_files} files (~{_estimate_windows(libri)} windows)")
+            else:
+                print(f"  Using all {len(libri)} LibriSpeech files (~{w_libri_full} windows)")
+        else:
             cap = min(5000, len(libri))
             libri = libri.sample(n=cap, random_state=42)
-            sources["librispeech"] = libri
-            print(f"Capped LibriSpeech to {cap}")
+            print(f"  Capped LibriSpeech to {cap} files")
+        sources["librispeech"] = libri
 
     # ── Combine all ──────────────────────────────────────────
     all_dfs = list(sources.values())
@@ -285,7 +309,7 @@ def build_unified_manifest():
     test_df["split"] = "test"
     final = pd.concat([train_df, val_df, test_df], ignore_index=True)
 
-    manifest_path = Path("datasets/manifest_unified.csv")
+    manifest_path = Path("data/manifest_unified.csv")
     final.to_csv(manifest_path, index=False)
 
     print(f"\nTrain: {len(train_df)}, Val: {len(val_df)}, Test: {len(test_df)}")

@@ -6,7 +6,7 @@ Trains BiasedSpeechClassifier on ALLSSTAR + LibriSpeech + AMI + Casual Conversat
 Usage:
     python train.py
     python train.py --epochs 12 --batch-size 16 --lr 1e-5
-    python train.py --manifest datasets/manifest_unified.csv
+    python train.py --manifest data/manifest_unified.csv
 """
 
 import argparse
@@ -209,7 +209,7 @@ def evaluate(model, loader, criterion, device):
 # ── Main ────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(description="Train wav2vec2 on combined datasets")
-    parser.add_argument("--manifest", type=str, default="datasets/manifest_unified.csv")
+    parser.add_argument("--manifest", type=str, default="data/manifest_unified.csv")
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--lr", type=float, default=1e-5)
