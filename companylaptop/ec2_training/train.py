@@ -225,12 +225,12 @@ def main():
     print(f"Device: {device}")
     if torch.cuda.is_available():
         gpu_name = torch.cuda.get_device_name()
-        vram = torch.cuda.get_device_properties(0).total_mem / 1e9
+        vram = torch.cuda.get_device_properties(0).total_memory / 1e9
         print(f"GPU: {gpu_name}, VRAM: {vram:.1f} GB")
         # Auto-adjust batch size for low VRAM
-        if vram < 12 and args.batch_size > 4:
-            print(f"  Low VRAM — reducing batch_size to 4")
-            args.batch_size = 4
+        if vram < 12 and args.batch_size > 8:
+            print(f"  Low VRAM — reducing batch_size to 8")
+            args.batch_size = 8
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
