@@ -31,6 +31,16 @@ except OSError:
     print("Run: python -m spacy download en_core_web_sm")
     sys.exit(1)
 
+# Lazy-loaded sentence transformer
+_sbert_model = None
+
+def _get_sbert_model():
+    global _sbert_model
+    if _sbert_model is None:
+        from sentence_transformers import SentenceTransformer
+        _sbert_model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+    return _sbert_model
+
 
 # ============================================================
 # Constants
@@ -153,6 +163,22 @@ def _empty_text_features():
         "self_ref_rate": 0, "discourse_marker_rate": 0, "hedge_rate": 0,
         "noun_rate": 0, "verb_rate": 0, "adj_rate": 0,
     }
+
+
+# ============================================================
+# Sentence Transformer Embeddings (384-dim)
+# ============================================================
+
+SBERT_DIM = 384
+
+def compute_text_embeddings(text):
+    """Encode transcript text into a 384-dim sentence embedding vector."""
+    if not text or len(text.strip()) < 10:
+        return {f"sbert_{i}": 0.0 for i in range(SBERT_DIM)}
+
+    model = _get_sbert_model()
+    embedding = model.encode(text, normalize_embeddings=True)
+    return {f"sbert_{i}": float(embedding[i]) for i in range(SBERT_DIM)}
 
 
 # ============================================================
@@ -330,7 +356,8 @@ def compute_wav2vec2_scores(audio_path, ort_session, sr=16000, window_sec=5.0, t
 # ============================================================
 
 def extract_all_features(transcripts_path, manifest_path, output_path,
-                         onnx_model_path=None, skip_prosodic=False):
+                         onnx_model_path=None, skip_prosodic=False,
+                         skip_sbert=False):
     """Extract all features for company data."""
 
     # Load transcripts
@@ -369,6 +396,12 @@ def extract_all_features(transcripts_path, manifest_path, output_path,
         else:
             prosodic_feats = compute_prosodic_features(filepath) if os.path.exists(filepath) else _empty_prosodic_features()
 
+        # Sentence transformer embeddings
+        if skip_sbert:
+            sbert_feats = {f"sbert_{i}": 0.0 for i in range(SBERT_DIM)}
+        else:
+            sbert_feats = compute_text_embeddings(text)
+
         # wav2vec2 scores
         wav2vec2_feats = {"wav2vec2_read_ratio": 0, "wav2vec2_mean_p_read": 0, "wav2vec2_max_p_read": 0}
         if ort_session and os.path.exists(filepath):
@@ -386,6 +419,7 @@ def extract_all_features(transcripts_path, manifest_path, output_path,
         row.update(text_feats)
         row.update(pause_feats)
         row.update(prosodic_feats)
+        row.update(sbert_feats)
         row.update(wav2vec2_feats)
         rows.append(row)
 
@@ -417,10 +451,12 @@ def main():
     parser.add_argument("--output", type=str, default="features.csv")
     parser.add_argument("--skip-prosodic", action="store_true",
                         help="Skip prosodic features (faster)")
+    parser.add_argument("--skip-sbert", action="store_true",
+                        help="Skip sentence transformer embeddings")
     args = parser.parse_args()
 
     extract_all_features(args.transcripts, args.manifest, args.output,
-                         args.onnx_model, args.skip_prosodic)
+                         args.onnx_model, args.skip_prosodic, args.skip_sbert)
 
 
 if __name__ == "__main__":
