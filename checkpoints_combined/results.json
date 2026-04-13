@@ -1,6 +1,0 @@
-{
-  "test_acc": 0.9963,
-  "test_f1": 0.9969,
-  "best_val_f1": 0.9959,
-  "best_epoch": 6
-}
