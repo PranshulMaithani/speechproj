@@ -68,13 +68,14 @@ audios2 (67% cheating) and audios4 (24% cheating) have very different class dist
 
 **Fix:** GroupKFold by batch + per-batch sample weighting.
 
-### 2e. WavLM XGBoost Is Overfit Too
+### 2e. WavLM XGBoost: High Dims but Works
 
-The WavLM XGBoost uses **768 features on 490 samples** -- a 0.64:1 ratio. This is actually worse than the SBERT hybrid (407:490) that visibly failed. It survives only because:
-- `colsample_bytree=0.3` limits each tree to ~230 random features
+The WavLM XGBoost uses **768 features on 490 samples** -- a 0.64:1 ratio. This normally suggests overfitting, but it works because:
+- `colsample_bytree=0.2` limits each tree to ~154 random features (implicit feature selection)
 - WavLM embeddings are high-quality pretrained representations (not random noise)
+- XGBoost's boosting naturally focuses on the most discriminative subsets
 
-But it's still memorizing training-set patterns. Evidence: it scores 80/83 on training CV but likely degrades significantly on audios5. **PCA reduction (768 → 64-100 dims)** would bring the ratio to 5-8:1, remove redundant/noisy dimensions, and improve generalization.
+**PCA was tried and failed:** compressing 768→80 dims dropped performance from ~85% to ~58% F1. The PCA projection destroyed discriminative signal that XGBoost's random subsampling preserves. The low `colsample_bytree` achieves the same regularization benefit without information loss.
 
 ### 2f. Overfitting in Combination Method
 
@@ -89,39 +90,42 @@ Both approaches overfit the combination:
 ## 3. Proposed Architecture: v3
 
 ```
-                                 +--[ faster_CrisperWhisper ]--+
-                                 |     (verbatim transcript     |
-                                 |      with fillers)           |
-                                 v                              v
-AUDIO ──> [ WavLM embeddings ] ──> PCA ──> WavLM XGBoost   Text+Audio XGBoost
-           (768-dim)            (64-100)   (audio-only)      (48 features)
-                                               |                  |
-                                               v                  v
-                                          temp-scale         temp-scale
-                                               |                  |
-                                               +-- calibrated avg-+
-                                                        |
-                                                        v
-                                                  threshold -> prediction
+                                 +--[ Whisper + filler prompt ]--+
+                                 |     (verbatim transcript      |
+                                 |      with fillers)            |
+                                 v                               v
+AUDIO ──> [ WavLM embeddings ] ──> WavLM XGBoost          Text+Audio XGBoost
+           (768-dim, raw)          (768 dims, csbt=0.2)     (48 features)
+                |                       |                        |
+                |                       v                        v
+                |                  temp-scale               temp-scale
+                |                       |                        |
+                |                       +--- calibrated avg -----+
+                |                                 |
+                +--- concat ---> Fused XGBoost    |
+                |                (~816 dims,      |
+                |                 csbt=0.2)       |
+                |                     |           |
+                |                temp-scale       |
+                v                     v           v
+           Compare all:    Fused vs Weighted Vote vs Text vs WavLM
 ```
 
-### Signal 1: WavLM XGBoost (with PCA reduction)
-- 768-dim pretrained WavLM embeddings → **PCA to 64-100 dims**
-- Current: 768 features on 490 samples = 0.64:1 ratio (heavily overfit)
-- After PCA: 64-100 features on 490 samples = 5-8:1 ratio (healthy)
-- PCA fit on training fold only (no data leakage), applied to val/test
-- Removes redundant/correlated embedding dimensions, keeps discriminative signal
-- Expected improvement: +2-5 F1 from reduced overfitting alone
+### 4 Model Variants (all compared side-by-side)
 
-```python
-from sklearn.decomposition import PCA
+| Model | Features | colsample_bytree | What it tests |
+|---|---|---|---|
+| **Text** | 48 handcrafted | 0.8 | Text/pause/prosodic signal alone |
+| **WavLM** | 768 raw dims | 0.2 | Audio embedding signal alone |
+| **Weighted Vote** | 0.6×WavLM + 0.4×Text | -- | Two calibrated models combined |
+| **Fused** | ~816 (48 + 768 concat) | 0.2 | Single model learns cross-signal interactions |
 
-# Fit on training data only
-pca_wavlm = PCA(n_components=80)  # 768 -> 80 dims
-X_train_pca = pca_wavlm.fit_transform(X_train_wavlm)
-X_val_pca = pca_wavlm.transform(X_val_wavlm)
-# ~85-90% variance preserved in 80 components
-```
+### Signal 1: WavLM XGBoost (raw 768 dims, NO PCA)
+- 768-dim pretrained WavLM embeddings used directly — **no PCA**
+- **PCA was tried and failed:** compressing 768→80 dims dropped WavLM from ~85% to ~58% F1
+- Instead, `colsample_bytree=0.2` acts as implicit feature selection (~154 features per tree)
+- This preserves all discriminative information while preventing overfitting
+- WavLM embeddings are high-quality pretrained representations (not random noise), so the high feature:sample ratio is tolerable
 
 ### Signal 2: Enhanced Text+Audio XGBoost (upgraded from 41 to ~48 features)
 
@@ -139,13 +143,20 @@ X_val_pca = pca_wavlm.transform(X_val_wavlm)
 
 Total: **48 features on 490 samples = 10:1 ratio** (healthy for XGBoost).
 
+### Signal 3: Fused XGBoost (text + WavLM concatenated)
+- Concatenates all 48 text features + 768 WavLM dims = ~816 features
+- Single XGBoost with `colsample_bytree=0.2` (~163 features per tree)
+- Advantage over weighted vote: can learn **cross-signal interactions** (e.g., low filler_rate + specific WavLM pattern = cheating)
+- May outperform weighted vote when text and audio signals are complementary
+
 ### Combination: Calibrated Weighted Average (not stacking)
 
 1. **Temperature scaling** on each model independently (1 parameter each, fit on calibration fold)
 2. **Fixed weighted average**: `0.6 * wavlm_cal + 0.4 * text_cal` (WavLM is stronger, give it more weight)
-3. **Threshold sweep** on calibration fold for precision target (95+)
+3. **Fused model** trained separately as an alternative — compare against weighted vote
+4. **Threshold sweep** on calibration fold for precision target (95+)
 
-No meta-learner. No grid search over weights. The weights are set based on relative model strength and don't need to be learned.
+No meta-learner. No grid search over weights. The weights are set based on relative model strength and don't need to be learned. The fused model is compared alongside to see if a single model outperforms the two-model weighted approach.
 
 ---
 
@@ -501,12 +512,13 @@ npyvi                       # nPVI computation
 
 Execute in this order. Each step is independently testable.
 
-### Phase 1: Fix Foundation (est. 1-2 hours)
-1. Switch to GroupKFold CV (by batch)
-2. Add per-batch sample weights
-3. Add PCA on WavLM embeddings (768 → 80 dims, fit on train fold only)
-4. Replace stacking with calibrated weighted average
-5. Retrain and evaluate -- get honest baseline numbers
+### Phase 1: Fix Foundation (est. 1-2 hours) -- DONE
+1. Switch to GroupKFold CV (by batch) -- DONE
+2. Add per-batch sample weights -- DONE (scale_pos_weight)
+3. WavLM: raw 768 dims, NO PCA, colsample_bytree=0.2 -- DONE (PCA tried and failed)
+4. Replace stacking with calibrated weighted average -- DONE
+5. Add fused model (text+WavLM concatenated) for comparison -- DONE
+6. Retrain and evaluate -- get honest baseline numbers
 
 ### Phase 2: Better ASR (est. 1-2 hours)
 5. Install and test faster_CrisperWhisper on CPU
@@ -549,7 +561,8 @@ The 84/76 measured on audios5 used weights found by grid search on training data
 | Improvement | Marginal Gain | Cumulative F1 | Why |
 |---|---|---|---|
 | Honest baseline (GroupKFold) | -- | ~75-80 | Starting point after removing overfit estimates |
-| + PCA on WavLM (768 → 80 dims) | +2-4 | ~78-83 | Reduces WavLM overfitting, better generalization |
+| + Raw WavLM (no PCA, csbt=0.2) | +0 | ~75-80 | PCA failed; raw 768 with low csbt works best |
+| + Fused model (text+WavLM concat) | +2-4 | ~78-83 | Cross-signal interactions in single model |
 | + CrisperWhisper (fillers work) | +2-3 | ~80-85 | filler_rate/count go from dead to discriminative |
 | + Voice quality (jitter/shimmer/HNR) | +1-3 | ~82-87 | Orthogonal signal, literature-validated |
 | + GPT-2 perplexity/burstiness | +1-3 | ~83-89 | Only helps for GPT-reading subset of cheating |
@@ -612,5 +625,5 @@ The improvements are still very worth doing because:
 | Voice quality features not discriminative on this data | Low | Low | Only 3 features added; easy to drop if not helping |
 | audios5 distribution fundamentally different | Medium | High | GroupKFold gives honest estimate early; per-batch weighting helps |
 | 48 features still overfit | Very Low | Medium | 10:1 ratio with XGBoost regularization is well within safe range |
-| PCA drops discriminative WavLM dims | Low | Medium | Try n_components=64,80,100 -- pick by CV; explained variance typically >85% at 80 dims |
+| ~~PCA drops discriminative WavLM dims~~ | **Confirmed** | **High** | PCA 768→80 dropped F1 from ~85% to ~58%. **Do not use PCA on WavLM.** Raw dims + colsample_bytree=0.2 is the fix. |
 | CrisperWhisper transcription quality differs from Whisper | Medium | Low | Different ASR may change other text features too; re-extract ALL features after switching |
