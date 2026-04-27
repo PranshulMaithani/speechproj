@@ -8,7 +8,8 @@
       "WebFetch(domain:ar5iv.labs.arxiv.org)",
       "WebFetch(domain:www.sciencedirect.com)",
       "WebFetch(domain:www.researchgate.net)",
-      "Bash(cd:*)"
+      "Bash(cd:*)",
+      "Bash(python -c \"import json; nb=json.load\\(open\\('label_audit_a4_a5.ipynb'\\)\\); print\\('cells:', len\\(nb['cells']\\)\\); [print\\(f'  {i}: {c[\\\\\"cell_type\\\\\"]:8s} {len\\(c[\\\\\"source\\\\\"]\\)} lines'\\) for i,c in enumerate\\(nb['cells']\\)]\")"
     ]
   }
 }
