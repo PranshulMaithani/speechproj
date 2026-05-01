@@ -51,6 +51,7 @@ PICK_TOP_N      = 3
 PICK_RANK_BY    = 'te_f1'   # column in summary_avg.csv to rank by
 PICK_ROTATION   = 'A'
 PICK_STRATEGY   = 'F1'      # only F1 strategy is in scope here
+EXP_TOP_N       = 3         # Section 2: top-K to detail per ranking (cv_f1 legit + a6_f1 cherry-pick)
 
 MIN_SPEAKING_S  = 30
 N_FOLDS         = 5
@@ -148,6 +149,43 @@ def best_f1_thr(p, y):
     f1 = np.where(denom > 0, 2*tp / np.maximum(denom, 1), 0.0)
     k = int(np.argmax(f1))
     return float(F1_THR_GRID[k]), float(f1[k])
+
+def metrics_by_region(p, y, regions, thr, min_n=5):
+    \"\"\"Per-region + overall metrics. Skips groups with fewer than min_n rows.\"\"\"
+    out = {'overall': _metrics_at(p, y, thr)}
+    if regions is None:
+        return out
+    regions = pd.Series(regions).fillna('unknown').astype(str).str.lower().values
+    for r in sorted(set(regions)):
+        mask = regions == r
+        if mask.sum() < min_n:
+            continue
+        out[r] = _metrics_at(p[mask], y[mask], thr)
+    return out
+
+def _flatten_region_metrics(by_region, prefix='r_'):
+    \"\"\"Flatten {region: metrics_dict} -> flat columns r_<region>_<metric>.\"\"\"
+    flat = {}
+    for r, m in by_region.items():
+        if r == 'overall': continue
+        flat[f'{prefix}{r}_f1']   = round(float(m['f1']),   4)
+        flat[f'{prefix}{r}_prec'] = round(float(m['prec']), 4)
+        flat[f'{prefix}{r}_rec']  = round(float(m['rec']),  4)
+        flat[f'{prefix}{r}_n']    = int(m['n'])
+        flat[f'{prefix}{r}_pos']  = int(m['tp'] + m['fn'])
+        flat[f'{prefix}{r}_tp']   = int(m['tp'])
+        flat[f'{prefix}{r}_fp']   = int(m['fp'])
+        flat[f'{prefix}{r}_fn']   = int(m['fn'])
+    return flat
+
+def _region_summary_str(by_region):
+    parts = []
+    for rg, m in by_region.items():
+        if rg == 'overall': continue
+        pos = m['tp'] + m['fn']
+        parts.append(f'{rg}: F1={m[\"f1\"]:.3f} P={m[\"prec\"]:.3f} R={m[\"rec\"]:.3f} '
+                     f'(n={m[\"n\"]}, +{pos})')
+    return '  '.join(parts)
 
 print('Imports + helpers ready.')""")
 
@@ -749,7 +787,14 @@ def load_gt(name):
     gt = gt.rename(columns={fn_col:'filename', lbl_col:'label_raw'})
     gt['label_int'] = gt['label_raw'].map(
         lambda x: LABEL_MAP.get(x, LABEL_MAP.get(str(x).lower().strip(), -1)))
-    return gt[gt['label_int'].isin([0,1])][['filename','label_int']]
+    region_col = next((c for c in gt.columns
+                       if c.lower() in ('region','country','locale','origin','nationality')), None)
+    if region_col is not None:
+        gt['region'] = (gt[region_col].astype(str).str.strip().str.lower()
+                        .replace({'nan':'unknown','none':'unknown','':'unknown'}))
+    else:
+        gt['region'] = 'unknown'
+    return gt[gt['label_int'].isin([0,1])][['filename','label_int','region']]
 
 def load_durations(name):
     p = DURATIONS_DIR / f'{name}_durations.csv'
@@ -992,7 +1037,14 @@ Saves:
 code("""# === 6. Run baseline evaluation ===
 df_a6  = batches[BATCH_NEW]
 y_a6   = df_a6['label_int'].values
-print(f'audios6 (filtered): n={len(df_a6)}  cheat={int((y_a6==1).sum())}/{len(y_a6)}\\n')
+regions_a6 = (df_a6['region'].astype(str).str.lower().values
+              if 'region' in df_a6.columns else np.array(['unknown']*len(df_a6)))
+region_counts = pd.Series(regions_a6).value_counts().to_dict()
+region_pos    = {r: int(((regions_a6 == r) & (y_a6 == 1)).sum()) for r in region_counts}
+print(f'audios6 (filtered): n={len(df_a6)}  cheat={int((y_a6==1).sum())}/{len(y_a6)}')
+print('  region breakdown: ' + '  '.join(f'{r}: n={n}, +{region_pos[r]}'
+                                          for r, n in region_counts.items()))
+print()
 
 MODES = [
     ('A', 'no_a5_in_train',  TRAIN_BATCHES_A),
@@ -1000,9 +1052,10 @@ MODES = [
 ]
 
 baseline_rows = []
-pred_cols = {'filename': df_a6['filename'].values,
+pred_cols = {'filename':     df_a6['filename'].values,
              'candidate_id': df_a6['candidate_id'].values,
-             'label': y_a6}
+             'region':       regions_a6,
+             'label':        y_a6}
 
 for rec in PICK_RECIPES:
     print('=' * 100)
@@ -1041,11 +1094,12 @@ for rec in PICK_RECIPES:
         # Step 3: optimal threshold sweep on audios6 (diagnostic only)
         opt_thr, opt_f1 = best_f1_thr(proba_a6, y_a6)
 
-        # Step 4: metrics at all three thresholds
+        # Step 4: metrics at all three thresholds (overall + per-region)
         for kind, thr in [('frozen', rec['frozen_thr']),
                            ('cv',     cv_thr),
                            ('optimal_a6', opt_thr)]:
-            m = _metrics_at(proba_a6, y_a6, thr)
+            by_r = metrics_by_region(proba_a6, y_a6, regions_a6, thr)
+            m    = by_r['overall']
             row = {
                 'pick':       rec['tag'],
                 'fusion_type': rec['fusion_type'],
@@ -1067,10 +1121,14 @@ for rec in PICK_RECIPES:
                 'src_te_f1':  rec['src_te_f1'],
                 'src_cv_f1':  rec['src_cv_f1'],
             }
+            row.update(_flatten_region_metrics(by_r))
             baseline_rows.append(row)
             print(f'     thr_kind={kind:11s}  thr={thr:.2f}  '
                   f'F1={m[\"f1\"]:.4f}  P={m[\"prec\"]:.4f}  R={m[\"rec\"]:.4f}  '
                   f'TP/FP/FN={m[\"tp\"]}/{m[\"fp\"]}/{m[\"fn\"]}')
+            rs = _region_summary_str(by_r)
+            if rs:
+                print(f'                                  per-region  {rs}')
         print(f'     [opt vs cv  thr drift = {opt_thr - cv_thr:+.2f}]  '
               f'[opt vs frozen thr drift = {opt_thr - rec[\"frozen_thr\"]:+.2f}]')
         # Add binary preds at all thresholds
@@ -1102,6 +1160,143 @@ for tag in baseline_df['pick'].unique():
     sub = sub.sort_values(['mode','thr_kind'])
     with pd.option_context('display.max_columns', None, 'display.width', 200, 'display.max_colwidth', 60):
         print(sub[display_cols].to_string(index=False))""")
+
+# ============================================================
+code("""# === 6.1b Per-region breakdown (IND vs PHP if both present) ===
+region_cols = sorted(set(c[2:-3] for c in baseline_df.columns
+                         if c.startswith('r_') and c.endswith('_f1')))
+if not region_cols or region_cols == ['unknown']:
+    print('No region info on audios6 (or only one group). Skipping per-region table.')
+else:
+    print(f'Regions detected on audios6: {region_cols}')
+    for tag in baseline_df['pick'].unique():
+        print('\\n' + '#'*120)
+        print(f'#  {tag} — per-region')
+        print('#'*120)
+        rows_r = []
+        sub = baseline_df[baseline_df['pick'] == tag]
+        for _, r in sub.iterrows():
+            base = {'mode': r['mode'], 'thr_kind': r['thr_kind'], 'thr': r['thr'],
+                    'overall_f1': r['a6_f1'], 'overall_P': r['a6_prec'], 'overall_R': r['a6_rec']}
+            for rg in region_cols:
+                base[f'{rg}_f1']   = r.get(f'r_{rg}_f1',   None)
+                base[f'{rg}_P']    = r.get(f'r_{rg}_prec', None)
+                base[f'{rg}_R']    = r.get(f'r_{rg}_rec',  None)
+                base[f'{rg}_n']    = r.get(f'r_{rg}_n',    None)
+                base[f'{rg}_pos']  = r.get(f'r_{rg}_pos',  None)
+            rows_r.append(base)
+        rdf = pd.DataFrame(rows_r).sort_values(['mode','thr_kind'])
+        with pd.option_context('display.max_columns', None, 'display.width', 220, 'display.max_colwidth', 60):
+            print(rdf.to_string(index=False))
+    print('\\nInterpretation:')
+    print('  F1(ind) >> F1(php)  ->  shift-bound on PHP. Per-region threshold + PHP labels first.')
+    print('  F1(ind) ~ F1(php)   ->  not a region issue. Check gap_opt_minus_cv (threshold) and src-vs-opt (model).')
+    print('  Read with overall_f1 to disentangle pooling effects.')""")
+
+# ============================================================
+code("""# === 6.1c Small-positive diagnostic: score distributions + AUC per region ===
+# Use this when PHP positives are too few for stable F1. F1 with 3-5 positives has
+# CIs of ~0.3, so don't tune on it. Distributions + AUC are far more stable.
+#
+# Read these:
+#   1) PHP-cheater mean ≫ PHP-honest mean  ->  model HAS signal on PHP, threshold/calibration drift
+#   2) PHP-cheater mean ≈ PHP-honest mean  ->  model has no PHP signal — bigger problem
+#   3) PHP-honest mean > IND-honest mean   ->  PHP being over-flagged (specificity shift)
+#   4) AUC(PHP) ~ AUC(IND)                  ->  ranking is preserved on PHP — calibration fix is enough
+#   5) AUC(PHP) << AUC(IND)                 ->  signal channel broke on PHP — augmentation / labels needed
+from sklearn.metrics import roc_auc_score
+
+proba_cols = [c for c in pred_df.columns if c.startswith('proba_')]
+y_all   = pred_df['label'].values
+rgs_all = pred_df['region'].astype(str).str.lower().values
+regions_present = sorted(set(rgs_all))
+
+print(f'Regions on audios6: {regions_present}')
+print(f'Per-region label counts:')
+for r in regions_present:
+    mask = rgs_all == r
+    n_pos = int(((mask) & (y_all == 1)).sum())
+    n_neg = int(((mask) & (y_all == 0)).sum())
+    flag  = '  *** few positives, F1 unreliable ***' if 0 < n_pos < 8 else ''
+    print(f'  {r:8s}  n={mask.sum():3d}  cheater={n_pos:3d}  honest={n_neg:3d}{flag}')
+print()
+
+dist_rows = []
+auc_rows  = []
+for col in proba_cols:
+    p = pred_df[col].values
+    print('-' * 100)
+    print(f'  {col}')
+    print('-' * 100)
+
+    # Score distribution per (region × label)
+    blocks = []
+    for r in regions_present:
+        for lbl_int, lbl_name in [(1, 'cheater'), (0, 'honest')]:
+            mask = (rgs_all == r) & (y_all == lbl_int)
+            if mask.sum() == 0: continue
+            ps = p[mask]
+            blocks.append({
+                'region': r, 'label': lbl_name, 'n': int(mask.sum()),
+                'mean':   round(float(ps.mean()),  4),
+                'median': round(float(np.median(ps)), 4),
+                'p25':    round(float(np.percentile(ps, 25)), 4),
+                'p75':    round(float(np.percentile(ps, 75)), 4),
+                'min':    round(float(ps.min()), 4),
+                'max':    round(float(ps.max()), 4),
+            })
+            dist_rows.append({'proba_col': col, **blocks[-1]})
+    bdf = pd.DataFrame(blocks).sort_values(['region','label'])
+    with pd.option_context('display.max_columns', None, 'display.width', 200):
+        print(bdf.to_string(index=False))
+
+    # Separation gap per region: cheater_mean - honest_mean
+    print('  Cheater-vs-honest mean gap per region (positive = signal):')
+    for r in regions_present:
+        mc = (rgs_all == r) & (y_all == 1)
+        mh = (rgs_all == r) & (y_all == 0)
+        if mc.sum() == 0 or mh.sum() == 0:
+            print(f'    {r:8s}: n/a (one class missing)')
+            continue
+        gap_mean = float(p[mc].mean() - p[mh].mean())
+        gap_med  = float(np.median(p[mc]) - np.median(p[mh]))
+        print(f'    {r:8s}:  mean_gap={gap_mean:+.4f}  median_gap={gap_med:+.4f}  '
+              f'(n_cheater={int(mc.sum())}, n_honest={int(mh.sum())})')
+
+    # AUC per region (more stable than F1 with small positives)
+    print('  AUC per region:')
+    for r in ['overall'] + regions_present:
+        mask = np.ones(len(p), bool) if r == 'overall' else (rgs_all == r)
+        ys = y_all[mask]
+        if len(set(ys)) < 2:
+            print(f'    {r:8s}:  n/a (only one class present)')
+            continue
+        auc = float(roc_auc_score(ys, p[mask]))
+        n_pos = int((ys == 1).sum())
+        flag  = '  *small-N: noisy*' if 0 < n_pos < 8 else ''
+        print(f'    {r:8s}:  AUC={auc:.4f}  n={mask.sum()}  cheaters={n_pos}{flag}')
+        auc_rows.append({'proba_col': col, 'region': r, 'auc': round(auc, 4),
+                         'n': int(mask.sum()), 'cheaters': n_pos})
+
+    # Honest-side specificity shift: PHP_honest mean vs IND_honest mean
+    if {'ind','php'}.issubset(regions_present):
+        m_ind_h = (rgs_all == 'ind') & (y_all == 0)
+        m_php_h = (rgs_all == 'php') & (y_all == 0)
+        if m_ind_h.sum() and m_php_h.sum():
+            shift = float(p[m_php_h].mean() - p[m_ind_h].mean())
+            tag = ('  -> PHP honest scored HIGHER (specificity shift, false-flag risk)'
+                   if shift > 0.05 else
+                   '  -> PHP honest scored LOWER (under-flag risk)' if shift < -0.05
+                   else '  -> honest score distributions match across regions')
+            print(f'  PHP_honest_mean - IND_honest_mean = {shift:+.4f}{tag}')
+    print()
+
+dist_df = pd.DataFrame(dist_rows)
+auc_df  = pd.DataFrame(auc_rows)
+dist_df.to_csv(SAVE_DIR / 'baseline_score_distributions.csv', index=False)
+auc_df .to_csv(SAVE_DIR / 'baseline_region_auc.csv', index=False)
+print(f'Saved: {SAVE_DIR/\"baseline_score_distributions.csv\"}')
+print(f'       {SAVE_DIR/\"baseline_region_auc.csv\"}')""")
 
 # ============================================================
 code("""# === 6.2 Diagnostic: model-fault vs threshold-fault summary ===
@@ -1162,12 +1357,16 @@ Protocol when enabled:
 - 5-fold candidate-isolated GroupKFold on the pool. Per fold: fit each of the 9 base models, build OOF proba.
 - For every 2-way pair and 3-way triple of base models, search weights on the concatenated OOF for **F1-max** (matching the F1 strategy in fusions_cv).
 - Refit on full pool with the chosen weights, score audios6, report `te_f1` at the chosen `cv_thr`.
-- Rank top candidates by **`a6_f1`** (since user asked for top-by-test-F1) and compare to the rotation-A picks.
+- **Top-K detail under TWO rankings** (`EXP_TOP_N` in cell 0):
+  - **`cv_f1`** — legitimate, leakage-free; this is the model the search would pick.
+  - **`a6_f1`** — post-hoc cherry-pick using audios6 for selection; for diagnostic interpretation only (upper bound on what fusion can achieve on this batch).
+  - Each top-K candidate is re-evaluated at `cv_thr` and at `optimal_a6_thr`, with **per-region (IND vs PHP) F1/P/R** if the GT carries region info.
+- Compare ranks of rotation-A picks under both orderings to see if a5 in train changed the optimal fusion.
 
 Heads-up: this is heavier than Section 1 (does a full base-model OOF on a larger pool, then 36 pairs + 84 triples × weight search). Expect 5–15 min depending on machine.""")
 
 # ============================================================
-code("""# === 7. Optional re-search with a5 in train ===
+code("""# === 7. Optional re-search with a5 in train (top-K by cv_f1 + a6_f1, with regions) ===
 if not RUN_EXPERIMENTAL_RESEARCH:
     print('RUN_EXPERIMENTAL_RESEARCH=False — skipping. Flip the flag in cell 0 to run.')
 else:
@@ -1208,16 +1407,22 @@ else:
             w3 = max(0.0, 1.0 - w1 - w2)
             W3_GRID.append((round(float(w1),2), round(float(w2),2), round(float(w3),2)))
 
-    rows = []
+    def _record_row(fusion_type, members_csv, weights_csv, fused_a6, thr, f1):
+        \"\"\"Build a results row at the search-derived cv_thr with overall + per-region a6 metrics.\"\"\"
+        by_r = metrics_by_region(fused_a6, y_a6, regions_a6, thr)
+        m    = by_r['overall']
+        row = {'fusion_type': fusion_type, 'members': members_csv, 'weights': weights_csv,
+               'cv_thr': round(float(thr),3), 'cv_f1': round(float(f1),4),
+               'a6_f1':  round(m['f1'],4),  'a6_prec': round(m['prec'],4), 'a6_rec': round(m['rec'],4),
+               'a6_tp':  m['tp'], 'a6_fp': m['fp'], 'a6_fn': m['fn'], 'a6_tn': m['tn'], 'a6_n': m['n']}
+        row.update(_flatten_region_metrics(by_r))
+        return row
+
+    rows   = []
     MODELS = list(BASE_REGISTRY.keys())
     for m in MODELS:
         thr_b, f1_b = best_f1_thr(base_oof[m], y_pool)
-        m_a6 = _metrics_at(base_a6[m], y_a6, thr_b)
-        rows.append({'fusion_type':'base','members':m,'weights':'',
-                      'cv_thr':round(thr_b,3),'cv_f1':round(f1_b,4),
-                      'a6_f1':round(m_a6['f1'],4),'a6_prec':round(m_a6['prec'],4),
-                      'a6_rec':round(m_a6['rec'],4)})
-
+        rows.append(_record_row('base', m, '', base_a6[m], thr_b, f1_b))
     for a, b in itertools.combinations(MODELS, 2):
         best = None
         for alpha in ALPHAS_2WAY:
@@ -1227,13 +1432,8 @@ else:
                 best = (alpha, thr, f1)
         alpha, thr, f1 = best
         fused_a6 = alpha * base_a6[a] + (1-alpha) * base_a6[b]
-        m_a6 = _metrics_at(fused_a6, y_a6, thr)
-        rows.append({'fusion_type':'2way','members':f'{a},{b}',
-                      'weights':f'{alpha:.2f},{1-alpha:.2f}',
-                      'cv_thr':round(thr,3),'cv_f1':round(f1,4),
-                      'a6_f1':round(m_a6['f1'],4),'a6_prec':round(m_a6['prec'],4),
-                      'a6_rec':round(m_a6['rec'],4)})
-
+        rows.append(_record_row('2way', f'{a},{b}', f'{alpha:.2f},{1-alpha:.2f}',
+                                fused_a6, thr, f1))
     for a, b, c in itertools.combinations(MODELS, 3):
         best = None
         for w1, w2, w3 in W3_GRID:
@@ -1243,34 +1443,106 @@ else:
                 best = ((w1,w2,w3), thr, f1)
         (w1,w2,w3), thr, f1 = best
         fused_a6 = w1*base_a6[a] + w2*base_a6[b] + w3*base_a6[c]
-        m_a6 = _metrics_at(fused_a6, y_a6, thr)
-        rows.append({'fusion_type':'3way','members':f'{a},{b},{c}',
-                      'weights':f'{w1:.2f},{w2:.2f},{w3:.2f}',
-                      'cv_thr':round(thr,3),'cv_f1':round(f1,4),
-                      'a6_f1':round(m_a6['f1'],4),'a6_prec':round(m_a6['prec'],4),
-                      'a6_rec':round(m_a6['rec'],4)})
+        rows.append(_record_row('3way', f'{a},{b},{c}', f'{w1:.2f},{w2:.2f},{w3:.2f}',
+                                fused_a6, thr, f1))
 
     research_df = pd.DataFrame(rows)
     research_df['short'] = research_df['members'].map(short_members)
-    research_df = research_df.sort_values('a6_f1', ascending=False).reset_index(drop=True)
     research_df.to_csv(SAVE_DIR / 'experimental_research.csv', index=False)
 
-    print('\\n=== TOP 15 by a6_f1 (re-searched on a2+a4+a5 pool) ===')
-    cols = ['fusion_type','short','weights','cv_thr','cv_f1','a6_f1','a6_prec','a6_rec']
-    with pd.option_context('display.max_columns', None, 'display.width', 200, 'display.max_colwidth', 60):
-        print(research_df.head(15)[cols].to_string(index=False))
+    # Step 4: top-K detailed eval, under BOTH rankings (cv_f1 = legit, a6_f1 = post-hoc)
+    def _members_weights_from_row(r):
+        if r['fusion_type'] == 'base':
+            return [r['members']], [1.0]
+        return r['members'].split(','), [float(x) for x in r['weights'].split(',')]
+
+    def _full_eval_top(top_df, label, cherry):
+        print('\\n' + '='*120)
+        print(f'  TOP {len(top_df)} by {label}')
+        if cherry:
+            print('  *** uses audios6 for selection — DIAGNOSTIC ONLY, not a legitimate ranking ***')
+        print('='*120)
+        out_rows = []
+        for ri, r in top_df.reset_index(drop=True).iterrows():
+            members, weights = _members_weights_from_row(r)
+            fused_a6 = np.zeros(len(df_a6))
+            for mm, ww in zip(members, weights):
+                fused_a6 += float(ww) * base_a6[mm]
+            thr_search = float(r['cv_thr'])
+            thr_opt, _ = best_f1_thr(fused_a6, y_a6)
+            print(f'\\n  rank {ri+1}: {r[\"short\"]:40s}  type={r[\"fusion_type\"]}  '
+                  f'cv_f1={r[\"cv_f1\"]:.4f}  weights={r[\"weights\"] or \"(single base)\"}')
+            for kind, thr in [('cv', thr_search), ('optimal_a6', thr_opt)]:
+                by_r = metrics_by_region(fused_a6, y_a6, regions_a6, thr)
+                m    = by_r['overall']
+                print(f'      thr_kind={kind:11s}  thr={thr:.2f}  '
+                      f'F1={m[\"f1\"]:.4f}  P={m[\"prec\"]:.4f}  R={m[\"rec\"]:.4f}  '
+                      f'TP/FP/FN={m[\"tp\"]}/{m[\"fp\"]}/{m[\"fn\"]}')
+                rs = _region_summary_str(by_r)
+                if rs:
+                    print(f'                                  per-region  {rs}')
+                row_out = {
+                    'rank_by':       label,
+                    'rank':          ri + 1,
+                    'fusion_type':   r['fusion_type'],
+                    'short':         r['short'],
+                    'members':       r['members'],
+                    'weights':       r['weights'],
+                    'thr_kind':      kind,
+                    'thr':           round(float(thr), 3),
+                    'cv_thr_search': thr_search,
+                    'cv_f1_search':  float(r['cv_f1']),
+                    'a6_f1':         round(m['f1'], 4),
+                    'a6_prec':       round(m['prec'], 4),
+                    'a6_rec':        round(m['rec'], 4),
+                    'a6_tp':         m['tp'], 'a6_fp': m['fp'],
+                    'a6_fn':         m['fn'], 'a6_tn': m['tn'],
+                    'a6_n':          m['n'],
+                }
+                row_out.update(_flatten_region_metrics(by_r))
+                out_rows.append(row_out)
+        return pd.DataFrame(out_rows)
+
+    top_n = max(int(EXP_TOP_N), 1)
+    top_cv_df = research_df.sort_values('cv_f1', ascending=False).head(top_n)
+    top_a6_df = research_df.sort_values('a6_f1', ascending=False).head(top_n)
+    detailed_cv = _full_eval_top(top_cv_df, 'cv_f1 (legit, leakage-free)',  cherry=False)
+    detailed_a6 = _full_eval_top(top_a6_df, 'a6_f1 (post-hoc cherry-pick)', cherry=True)
+    detailed = pd.concat([detailed_cv, detailed_a6], ignore_index=True)
+    detailed.to_csv(SAVE_DIR / 'experimental_top_models.csv', index=False)
+
+    # Step 5: full-table head + rotation-A pick rank comparison
+    print('\\n' + '='*120)
+    print('  Full search summary heads')
+    print('='*120)
+    region_cols_show = sorted(set(c[2:-3] for c in research_df.columns
+                                  if c.startswith('r_') and c.endswith('_f1')))
+    region_show = [f'r_{rg}_f1' for rg in region_cols_show]
+    cols = (['fusion_type','short','weights','cv_thr','cv_f1','a6_f1','a6_prec','a6_rec']
+            + region_show)
+    cols = [c for c in cols if c in research_df.columns]
+    with pd.option_context('display.max_columns', None, 'display.width', 230, 'display.max_colwidth', 60):
+        print('\\n-- Top 15 by a6_f1 (post-hoc cherry-pick) --')
+        print(research_df.sort_values('a6_f1', ascending=False).head(15)[cols].to_string(index=False))
+        print('\\n-- Top 15 by cv_f1 (legitimate ranking) --')
+        print(research_df.sort_values('cv_f1', ascending=False).head(15)[cols].to_string(index=False))
 
     # Compare against rotation A picks
-    print('\\n=== Rotation-A picks present in re-search ===')
+    print('\\n=== Rotation-A picks ranks in re-search ===')
+    research_by_a6 = research_df.sort_values('a6_f1', ascending=False).reset_index(drop=True)
+    research_by_cv = research_df.sort_values('cv_f1', ascending=False).reset_index(drop=True)
     for rec in PICK_RECIPES:
         key = ','.join(rec['members'])
-        match = research_df[research_df['members'] == key]
-        if len(match):
-            r = match.iloc[0]
-            rank = research_df.index[research_df['members'] == key][0] + 1
-            print(f'  rank #{rank:3d} (of {len(research_df)}): {short_members(key):40s}  '
-                  f'a6_f1={r[\"a6_f1\"]:.4f}  cv_thr={r[\"cv_thr\"]:.2f}  cv_f1={r[\"cv_f1\"]:.4f}')
-    print(f'\\nSaved: {SAVE_DIR/\"experimental_research.csv\"}')""")
+        m_a6 = research_by_a6[research_by_a6['members'] == key]
+        if len(m_a6):
+            ra = research_by_a6.index[research_by_a6['members'] == key][0] + 1
+            rc = research_by_cv.index[research_by_cv['members'] == key][0] + 1
+            r  = m_a6.iloc[0]
+            print(f'  {short_members(key):40s}  rank_by_a6f1={ra:3d}/{len(research_df)}  '
+                  f'rank_by_cvf1={rc:3d}/{len(research_df)}  '
+                  f'a6_f1={r[\"a6_f1\"]:.4f}  cv_f1={r[\"cv_f1\"]:.4f}  cv_thr={r[\"cv_thr\"]:.2f}')
+    print(f'\\nSaved: {SAVE_DIR/\"experimental_research.csv\"}        (full search, {len(research_df)} rows)')
+    print(f'       {SAVE_DIR/\"experimental_top_models.csv\"}      (top-{top_n} per ranking, with regions)')""")
 
 # ============================================================
 md("""## 8. How to read these results
@@ -1289,12 +1561,17 @@ md("""## 8. How to read these results
 - If Mode B = Mode A on `a6_optimal_f1`: a5 didn't add new signal. Mode A is simpler.
 - If Mode B < Mode A on `a6_optimal_f1`: a5 introduced noise / contradiction with the new distribution.
 
+**Region-stratified read (from `baseline_results.csv` + cell 6.1b table):**
+- F1(ind on a6) ≫ F1(php on a6) → linguistic / acoustic shift on Filipino English. The model is fine on its trained distribution but doesn't generalise to PHP. Quickest fix: per-region threshold and isotonic calibration. Bigger fix: 50-100 PHP labels added to train, or augmentation when re-extracting.
+- F1(ind) ≈ F1(php) but both below `src_te_f1` → not a region issue. Either threshold drift (look at `gap_opt_minus_cv`) or a global batch shift (recording, prompt, label rule).
+
 **Files in `checkpoints_audios6_eval/`:**
-- `baseline_results.csv` — full results, one row per (pick, mode, threshold_kind).
+- `baseline_results.csv` — full results, one row per (pick, mode, threshold_kind), with `r_<region>_*` columns.
 - `baseline_diagnostic.csv` — compact comparison table.
-- `baseline_predictions.csv` — per-audio probas + binary preds for every pick × mode × threshold.
+- `baseline_predictions.csv` — per-audio probas + binary preds for every pick × mode × threshold (includes `region`).
 - `baseline_oof_{tag}_modeA.csv`, `..._modeB.csv` — OOF probas on each training pool (for re-deriving thresholds or sanity checks).
-- `experimental_research.csv` — only if `RUN_EXPERIMENTAL_RESEARCH=True` was set. Full re-search ranking.""")
+- `experimental_research.csv` — only if `RUN_EXPERIMENTAL_RESEARCH=True` was set. Full re-search ranking with per-region cols.
+- `experimental_top_models.csv` — Section 2 top-`EXP_TOP_N` per ranking (`cv_f1` legit + `a6_f1` cherry-pick) × {cv, optimal_a6} threshold, with per-region metrics.""")
 
 # ============================================================
 nb = {
