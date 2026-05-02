@@ -284,6 +284,18 @@ def fused(members, weights, score_dict):
     return s
 
 
+def fit_weighted(mdl, feat_cols, df):
+    ac = [c for c in feat_cols if c in df.columns]
+    X  = df[ac].fillna(0).values
+    y  = df['label_int'].values
+    sw = df['sample_weight'].fillna(1.0).values if 'sample_weight' in df.columns else np.ones(len(df))
+    m  = deepcopy(mdl)
+    try:
+        m.fit(X, y, sample_weight=sw)
+    except TypeError:
+        m.fit(X, y)
+    return m, ac
+
 print('Utilities loaded.')
 """, "code-02"))
 
@@ -924,16 +936,7 @@ else:
     REAL_POOL['sample_weight']   = 1.0
     EXPANDED_POOL = pd.concat([REAL_POOL, PSEUDO_POOL], ignore_index=True).dropna(subset=['label_int'])
 
-    def fit_weighted(mdl, feat_cols, df):
-        ac   = [c for c in feat_cols if c in df.columns]
-        X, y = df[ac].fillna(0).values, df['label_int'].values
-        sw   = df['sample_weight'].fillna(1.0).values if 'sample_weight' in df.columns else np.ones(len(df))
-        m    = deepcopy(mdl)
-        try:
-            m.fit(X, y, sample_weight=sw)
-        except TypeError:
-            m.fit(X, y)
-        return m, ac
+
 
     A3_MODEL = {}
     A3_A6    = {}
