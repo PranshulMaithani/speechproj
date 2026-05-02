@@ -948,7 +948,20 @@ else:
         base_score_cols['p_prosodic'] = BASE_A6_ALL['prosodic_xgb']
 
     # ── single deterministic K from seed=42 50-audio slice ──────────────
-    sl42 = CALIB_SLICE_IDX[AUDIT_SEED]
+    def _audit_slice(seed, ss=CALIB_SLICE_SIZE):
+        rng_a   = np.random.RandomState(seed)
+        pos     = np.where(y_a6_full == 1)[0]
+        neg     = np.where(y_a6_full == 0)[0]
+        n_pos_s = max(1, round(ss * y_a6_full.mean()))
+        n_neg_s = ss - n_pos_s
+        n_pos_s = min(n_pos_s, len(pos))
+        n_neg_s = min(n_neg_s, len(neg))
+        return np.concatenate([
+            rng_a.choice(pos, n_pos_s, replace=False),
+            rng_a.choice(neg, n_neg_s, replace=False),
+        ])
+
+    sl42 = _audit_slice(AUDIT_SEED)
     K42  = y_a6_full[sl42].mean()
     THR_AUDIT = float(np.percentile(BEST_A6, 100.0 * (1.0 - K42)))
     pred_audit = (BEST_A6 >= THR_AUDIT).astype(int)
@@ -1158,7 +1171,15 @@ if TIER_A_BEST_A6 is not None and not np.isnan(TIER_A_BEST_F1):
             print(f'  {label}: F1={f1:.4f}  Δ={delta:+.4f}  (under threshold; no CI)')
             continue
         # use seed=42 audit threshold for the Tier B condition
-        sl42      = CALIB_SLICE_IDX[AUDIT_SEED]
+        rng_s     = np.random.RandomState(AUDIT_SEED)
+        pos_s     = np.where(y_a6_full == 1)[0]
+        neg_s     = np.where(y_a6_full == 0)[0]
+        n_pos_42  = min(max(1, round(CALIB_SLICE_SIZE * y_a6_full.mean())), len(pos_s))
+        n_neg_42  = min(CALIB_SLICE_SIZE - n_pos_42, len(neg_s))
+        sl42      = np.concatenate([
+            rng_s.choice(pos_s, n_pos_42, replace=False),
+            rng_s.choice(neg_s, n_neg_42, replace=False),
+        ])
         K42       = y_a6_full[sl42].mean()
         thr_b     = float(np.percentile(sc, 100.0 * (1.0 - K42)))
         lo, hi, mu = bootstrap_ci(y_a6_full, sc, thr_b, TIER_A_BEST_A6, ta_thr)
