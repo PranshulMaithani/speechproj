@@ -207,7 +207,8 @@ def avail(cols, df):
 
 def Xy(df, cols):
     c = avail(cols, df)
-    return df[c].fillna(0).values, df['label_int'].values, c
+    y = df['label_int'].values if 'label_int' in df.columns else None
+    return df[c].fillna(0).values, y, c
 
 
 def fit_model(model, feat_cols, df_train):
