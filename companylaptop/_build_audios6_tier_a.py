@@ -927,7 +927,7 @@ else:
     def fit_weighted(mdl, feat_cols, df):
         ac   = [c for c in feat_cols if c in df.columns]
         X, y = df[ac].fillna(0).values, df['label_int'].values
-        sw   = df.get('sample_weight', pd.Series(1.0, index=df.index)).values
+        sw   = df['sample_weight'].fillna(1.0).values if 'sample_weight' in df.columns else np.ones(len(df))
         m    = deepcopy(mdl)
         try:
             m.fit(X, y, sample_weight=sw)
