@@ -863,6 +863,11 @@ if BD3 is None:
 else:
     df3_work = BD3.copy()
     for vname, (m, uc) in VIEW_MODEL.items():
+        missing = [c for c in uc if c not in df3_work.columns]
+        if missing:
+            print(f'  SKIP {vname} on audios3: {len(missing)}/{len(uc)} cols absent '
+                  f'(e.g. {missing[:3]})')
+            continue
         raw_p = predict_proba(m, uc, df3_work)
         if vname in VIEW_CAL:
             cal_p = VIEW_CAL[vname].predict_proba(raw_p.reshape(-1, 1))[:, 1]
