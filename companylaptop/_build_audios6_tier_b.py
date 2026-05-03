@@ -866,16 +866,25 @@ else:
             for combo in itertools.combinations(bases_for_b3, k):
                 for ws in gen():
                     fo = fused(list(combo), ws, {m: sub_score[m] for m in combo})
-                    f1s_fold = []
+                    f1s_fold, ps_fold, rs_fold, thr_fold_lst = [], [], [], []
                     for tr, va in skf.split(np.zeros_like(y_r), y_r):
                         thr_fold, _ = sweep_thr(y_r[tr], fo[tr])
-                        f1s_fold.append(f1_score(y_r[va], (fo[va] >= thr_fold).astype(int),
-                                                  zero_division=0))
+                        pred_va = (fo[va] >= thr_fold).astype(int)
+                        f1s_fold.append(f1_score(y_r[va], pred_va, zero_division=0))
+                        ps_fold.append(precision_score(y_r[va], pred_va, zero_division=0))
+                        rs_fold.append(recall_score(y_r[va], pred_va, zero_division=0))
+                        thr_fold_lst.append(thr_fold)
                     cv_f1 = float(np.mean(f1s_fold))
+                    cand = {'k':k,'members':list(combo),'weights':ws,
+                            'cv_f1':cv_f1,
+                            'cv_p': float(np.mean(ps_fold)),
+                            'cv_r': float(np.mean(rs_fold)),
+                            'cv_thr': float(np.mean(thr_fold_lst)),
+                            'cv_auc': float(roc_auc_score(y_r, fo)) if len(np.unique(y_r))>1 else float('nan')}
                     if k == 2 and cv_f1 > best_2['cv_f1']:
-                        best_2 = {'k':2,'members':list(combo),'weights':ws,'cv_f1':cv_f1}
+                        best_2 = cand
                     elif k == 3 and cv_f1 > best_3['cv_f1']:
-                        best_3 = {'k':3,'members':list(combo),'weights':ws,'cv_f1':cv_f1}
+                        best_3 = cand
 
         # global weights = B1+B2 unified best (applied within region)
         global_fo = B12_BEST_A6[mk] if B12_BEST_A6 is not None else None
@@ -891,7 +900,11 @@ else:
                 'global_f1': round(f1_global, 4),
                 'region_specific_members': '+'.join(best['members']),
                 'region_specific_weights': json.dumps(best['weights']),
-                'region_specific_f1': round(best['cv_f1'], 4),
+                'region_specific_f1':  round(best['cv_f1'],  4),
+                'region_specific_p':   round(best.get('cv_p',  float('nan')), 4),
+                'region_specific_r':   round(best.get('cv_r',  float('nan')), 4),
+                'region_specific_auc': round(best.get('cv_auc',float('nan')), 4),
+                'region_specific_thr': round(best.get('cv_thr',float('nan')), 4),
                 'gap_vs_global': round(best['cv_f1'] - f1_global, 4),
             })
             print(f'  {reg} {tag}: global F1={f1_global:.3f}  '
@@ -1071,45 +1084,73 @@ def _push(condition, pick, region, F1, P=float('nan'), R=float('nan'),
         'notes': notes, 'delta_vs_tierA_best': delta,
     })
 
-# baseline_combined_topk = Tier A best (copied)
-if not np.isnan(TIER_A_BEST_F1):
-    _push('baseline_combined_topk', TIER_A_BEST_NAME, 'overall',
-          TIER_A_BEST_F1, notes='Tier A floor (copied from tier_a_summary.csv)')
-
-# B1 Top-K% (best B1 fusion via mean over slices)
+# Top-K% metrics: mean F1/P/R across the 20 slices, plus AUC (slice-invariant)
+# and mean Top-K threshold.
 def _topk_metrics(scores, y, slices, region_mask=None):
-    f1s, ps, rs = [], [], []
+    f1s, ps, rs, thrs = [], [], [], []
     n_eval_acc = 0
     for seed in slices:
         sl = CALIB_SLICE_IDX[seed]
-        ri, pred, _ = topk_predict(scores, sl, y)
+        ri, pred, thr_k = topk_predict(scores, sl, y)
         if ri is None: continue
-        y_r = y[ri]
+        y_r = y[ri]; s_r = scores[ri]
         if region_mask is not None:
             mk = region_mask[ri]
             if mk.sum() < 5: continue
-            y_r = y_r[mk]; pred = pred[mk]
+            y_r = y_r[mk]; pred = pred[mk]; s_r = s_r[mk]
         n_eval_acc = max(n_eval_acc, len(y_r))
         f1s.append(f1_score(y_r, pred, zero_division=0))
         ps.append(precision_score(y_r, pred, zero_division=0))
         rs.append(recall_score(y_r, pred, zero_division=0))
+        thrs.append(thr_k)
     if not f1s: return None
-    return (np.mean(f1s), np.mean(ps), np.mean(rs), n_eval_acc)
+    # AUC is threshold-independent; compute on the relevant subset (region-masked) once
+    if region_mask is not None:
+        idx = np.where(region_mask)[0]
+        y_auc, s_auc = y[idx], scores[idx]
+    else:
+        y_auc, s_auc = y, scores
+    auc = roc_auc_score(y_auc, s_auc) if len(np.unique(y_auc)) > 1 else float('nan')
+    n_pos = int(np.asarray(y_auc).sum())
+    return {'F1': float(np.mean(f1s)), 'P': float(np.mean(ps)), 'R': float(np.mean(rs)),
+            'AUC': float(auc), 'thr': float(np.mean(thrs)),
+            'n_pos': n_pos, 'n_eval': n_eval_acc}
+
+
+# baseline_combined_topk = Tier A floor: recompute P/R/AUC/thr from the loaded
+# combined a6 scores at the seed=42 audit threshold (apples-to-apples vs Tier B).
+if TIER_A_BEST_A6 is not None and not np.isnan(TIER_A_BEST_F1):
+    ta_metrics = _topk_metrics(TIER_A_BEST_A6, y_a6_full, CALIB_SEEDS)
+    if ta_metrics:
+        _push('baseline_combined_topk', TIER_A_BEST_NAME, 'overall',
+              ta_metrics['F1'], P=ta_metrics['P'], R=ta_metrics['R'],
+              AUC=ta_metrics['AUC'], n_pos=ta_metrics['n_pos'],
+              n_eval=ta_metrics['n_eval'], thr=round(ta_metrics['thr'], 4),
+              notes='Tier A floor; metrics recomputed via Top-K% on combined_a6_scores.csv')
+elif not np.isnan(TIER_A_BEST_F1):
+    # fall back to F1-only when scores file is missing
+    _push('baseline_combined_topk', TIER_A_BEST_NAME, 'overall',
+          TIER_A_BEST_F1, notes='Tier A floor (F1 from tier_a_summary.csv; scores missing)')
 
 
 def _push_topk(label, members_str, scores):
     if scores is None: return
     overall = _topk_metrics(scores, y_a6_full, CALIB_SEEDS)
     if overall:
-        _push(label, members_str, 'overall', overall[0], P=overall[1], R=overall[2],
-              n_eval=overall[3], notes=f'mean over {N_REPEATS} draws')
+        _push(label, members_str, 'overall', overall['F1'],
+              P=overall['P'], R=overall['R'], AUC=overall['AUC'],
+              n_pos=overall['n_pos'], n_eval=overall['n_eval'],
+              thr=round(overall['thr'], 4),
+              notes=f'mean over {N_REPEATS} draws')
     if 'region' in df_a6.columns:
         for reg in sorted(df_a6['region'].dropna().unique()):
             rm = (df_a6['region'].values == reg)
             r_metrics = _topk_metrics(scores, y_a6_full, CALIB_SEEDS, region_mask=rm)
             if r_metrics:
-                _push(label, members_str, reg, r_metrics[0], P=r_metrics[1],
-                      R=r_metrics[2], n_eval=r_metrics[3],
+                _push(label, members_str, reg, r_metrics['F1'],
+                      P=r_metrics['P'], R=r_metrics['R'], AUC=r_metrics['AUC'],
+                      n_pos=r_metrics['n_pos'], n_eval=r_metrics['n_eval'],
+                      thr=round(r_metrics['thr'], 4),
                       notes=f'mean over {N_REPEATS} draws')
 
 
@@ -1124,7 +1165,12 @@ if 'B3_RAN' in dir() and B3_RAN:
         b3df = pd.read_csv(b3_path)
         for _, r in b3df.iterrows():
             _push('B3_region', r['region_specific_members'], str(r['region']),
-                  r['region_specific_f1'], notes=f'region-specific weights (DIAGNOSTIC, not shipped); gap_vs_global={r["gap_vs_global"]:+.3f}')
+                  r['region_specific_f1'],
+                  P=r.get('region_specific_p',   float('nan')),
+                  R=r.get('region_specific_r',   float('nan')),
+                  AUC=r.get('region_specific_auc', float('nan')),
+                  thr=r.get('region_specific_thr', float('nan')),
+                  notes=f'region-specific weights (DIAGNOSTIC, not shipped); gap_vs_global={r["gap_vs_global"]:+.3f}')
 
 S = pd.DataFrame(summary)
 
@@ -1134,7 +1180,9 @@ overall_b = S[(S['region'] == 'overall') &
 if len(overall_b) > 0:
     bw = overall_b.sort_values('F1', ascending=False).iloc[0]
     _push('best_overall', bw['pick_name'], 'overall', bw['F1'],
-          P=bw['P'], R=bw['R'], n_eval=bw['n_eval'],
+          P=bw['P'], R=bw['R'], AUC=bw['AUC'],
+          n_pos=bw['n_pos'], n_eval=bw['n_eval'],
+          thr=bw['threshold'],
           notes=f'winner = {bw["condition"]}')
     S = pd.DataFrame(summary)
 
