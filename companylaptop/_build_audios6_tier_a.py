@@ -548,8 +548,10 @@ for pn, pc in PICKS.items():
     othr, _ = sweep_thr(y_a6, scores)
 
     print(f'\\n── {pn} ──')
+    # AUC is threshold-independent — compute once per pick over full a6
+    pick_auc = roc_auc_score(y_a6, scores) if len(np.unique(y_a6)) > 1 else float('nan')
     for ss in SLICE_SIZES:
-        f1s, ps, rs = [], [], []
+        f1s, ps, rs, thrs = [], [], [], []
         f1s_ind, f1s_php = [], []
         for seed in CALIB_SEEDS:
             rng = np.random.RandomState(seed)
@@ -579,6 +581,7 @@ for pn, pc in PICKS.items():
             f1s.append(f1_score(y_rem, pred, zero_division=0))
             ps.append(precision_score(y_rem, pred, zero_division=0))
             rs.append(recall_score(y_rem, pred, zero_division=0))
+            thrs.append(thr_k)
             if 'region' in df_a6.columns:
                 reg_s = df_a6['region'].values[rem_idx]
                 for reg, lst in [('IND', f1s_ind), ('PHP', f1s_php)]:
@@ -607,6 +610,8 @@ for pn, pc in PICKS.items():
             'topk_f1_std':  round(np.std(f1s),  4),
             'topk_prec_mean': round(np.mean(ps), 4),
             'topk_rec_mean':  round(np.mean(rs), 4),
+            'topk_thr_mean':  round(float(np.mean(thrs)), 4) if thrs else float('nan'),
+            'topk_auc':       round(float(pick_auc), 4) if not np.isnan(pick_auc) else float('nan'),
             'topk_f1_ind_mean': round(np.mean(f1s_ind), 4) if f1s_ind else float('nan'),
             'topk_f1_php_mean': round(np.mean(f1s_php), 4) if f1s_php else float('nan'),
             'frozen_f1': round(froz_f1, 4),
@@ -977,8 +982,9 @@ else:
         pc   = PICKS[pn]
         fthr = pc['frozen_thr']
         cthr = pc.get('cv_thr', fthr)
+        pick_auc = roc_auc_score(y_a6, scores) if len(np.unique(y_a6)) > 1 else float('nan')
         for ss in SLICE_SIZES:
-            f1s = []
+            f1s, ps_, rs_, thrs_ = [], [], [], []
             for seed in CALIB_SEEDS:
                 sl_idx = CALIB_SLICE_IDX.get(seed)
                 if sl_idx is None: continue
@@ -989,11 +995,19 @@ else:
                 s_rem = scores[rem_idx]
                 y_rem = y_a6[rem_idx]
                 thr_k = float(np.percentile(s_rem, 100.0 * (1.0 - K_hat)))
-                f1s.append(f1_score(y_rem, (s_rem >= thr_k).astype(int), zero_division=0))
+                pred  = (s_rem >= thr_k).astype(int)
+                f1s.append(f1_score(y_rem, pred, zero_division=0))
+                ps_.append(precision_score(y_rem, pred, zero_division=0))
+                rs_.append(recall_score(y_rem, pred, zero_division=0))
+                thrs_.append(thr_k)
             if not f1s: continue
             a3_topk_rows.append({'pick':pn,'slice_size':ss,
                                   'topk_f1_mean':round(np.mean(f1s),4),
                                   'topk_f1_std': round(np.std(f1s), 4),
+                                  'topk_prec_mean':round(np.mean(ps_),4),
+                                  'topk_rec_mean': round(np.mean(rs_),4),
+                                  'topk_thr_mean': round(float(np.mean(thrs_)),4),
+                                  'topk_auc':      round(float(pick_auc),4) if not np.isnan(pick_auc) else float('nan'),
                                   'source':'A3'})
     pd.DataFrame(a3_topk_rows).to_csv(SAVE_DIR / 'tierA3_topk_results.csv', index=False)
 
@@ -1049,7 +1063,9 @@ else:
         comb_a6_out.to_csv(SAVE_DIR / 'combined_a6_scores.csv', index=False)
 
     # Top-K% on combined
-    comb_topk = []
+    comb_topk, comb_p, comb_r, comb_thr = [], [], [], []
+    comb_auc = (roc_auc_score(y_a6, scores)
+                if HAS_A6 and len(np.unique(y_a6)) > 1 else float('nan'))
     for seed in CALIB_SEEDS:
         sl_idx = CALIB_SLICE_IDX.get(seed)
         if sl_idx is None or not HAS_A6: continue
@@ -1060,11 +1076,21 @@ else:
         s_rem  = scores[rem_idx]
         y_rem  = y_a6[rem_idx]
         thr_k  = float(np.percentile(s_rem, 100.0 * (1.0 - K_hat)))
-        comb_topk.append(f1_score(y_rem, (s_rem >= thr_k).astype(int), zero_division=0))
+        pred   = (s_rem >= thr_k).astype(int)
+        comb_topk.append(f1_score(y_rem, pred, zero_division=0))
+        comb_p.append(precision_score(y_rem, pred, zero_division=0))
+        comb_r.append(recall_score(y_rem, pred, zero_division=0))
+        comb_thr.append(thr_k)
     if comb_topk:
-        print(f'  Combined Top-K%: F1={np.mean(comb_topk):.3f}±{np.std(comb_topk):.3f}')
+        print(f'  Combined Top-K%: F1={np.mean(comb_topk):.3f}±{np.std(comb_topk):.3f}  '
+              f'P={np.mean(comb_p):.3f}  R={np.mean(comb_r):.3f}  AUC={comb_auc:.3f}  '
+              f'thr={np.mean(comb_thr):.4f}')
         pd.DataFrame([{'source':'A2A3_combined','slice_size':CALIB_SLICE_SIZE,
                         'topk_f1_mean':round(np.mean(comb_topk),4),
+                        'topk_prec_mean': round(np.mean(comb_p), 4),
+                        'topk_rec_mean':  round(np.mean(comb_r), 4),
+                        'topk_thr_mean':  round(float(np.mean(comb_thr)), 4),
+                        'topk_auc':       round(float(comb_auc), 4) if not np.isnan(comb_auc) else float('nan'),
                         'topk_f1_std': round(np.std(comb_topk),4)}]).to_csv(
             SAVE_DIR / 'combined_topk_results.csv', index=False)
 
@@ -1117,9 +1143,11 @@ if len(topk_df) > 0:
         summary_rows.append({
             'condition': 'A1_topk', 'pick_name': pn, 'region': 'overall',
             'F1': row['topk_f1_mean'], 'P': row['topk_prec_mean'],
-            'R': row['topk_rec_mean'], 'AUC': float('nan'),
+            'R': row['topk_rec_mean'],
+            'AUC': row.get('topk_auc', float('nan')),
             'n_pos': float('nan'), 'n_eval': row['n_remaining'],
-            'threshold': float('nan'), 'notes': f'mean±std over {N_REPEATS} draws',
+            'threshold': row.get('topk_thr_mean', float('nan')),
+            'notes': f'mean±std over {N_REPEATS} draws',
         })
 
 # ── A2 augmented fusion ───────────────────────────────────────────────────
@@ -1136,7 +1164,8 @@ if HAS_A6 and len(aug_df) > 0:
         for reg in regions:
             _add('A2_cv', '+'.join(best_mems), reg, sc_a2, y_a6, best_thr_a2)
         # A2 Top-K%
-        tk_a2 = []
+        tk_a2, tk_a2_p, tk_a2_r, tk_a2_thr = [], [], [], []
+        a2_auc = roc_auc_score(y_a6, sc_a2) if len(np.unique(y_a6)) > 1 else float('nan')
         for seed in CALIB_SEEDS:
             sl = CALIB_SLICE_IDX.get(seed)
             if sl is None: continue
@@ -1144,13 +1173,20 @@ if HAS_A6 and len(aug_df) > 0:
             K_h  = y_a6[sl].mean()
             s_r  = sc_a2[rem]; y_r = y_a6[rem]
             t_k  = float(np.percentile(s_r, 100.0*(1-K_h)))
-            tk_a2.append(f1_score(y_r, (s_r >= t_k).astype(int), zero_division=0))
+            pred = (s_r >= t_k).astype(int)
+            tk_a2.append(f1_score(y_r, pred, zero_division=0))
+            tk_a2_p.append(precision_score(y_r, pred, zero_division=0))
+            tk_a2_r.append(recall_score(y_r, pred, zero_division=0))
+            tk_a2_thr.append(t_k)
         if tk_a2:
             summary_rows.append({'condition':'A2_topk','pick_name':'+'.join(best_mems),
                                   'region':'overall','F1':round(np.mean(tk_a2),4),
-                                  'P':float('nan'),'R':float('nan'),'AUC':float('nan'),
+                                  'P':round(np.mean(tk_a2_p),4),
+                                  'R':round(np.mean(tk_a2_r),4),
+                                  'AUC':round(float(a2_auc),4) if not np.isnan(a2_auc) else float('nan'),
                                   'n_pos':float('nan'),'n_eval':len(rem),
-                                  'threshold':float('nan'),'notes':f'mean over {N_REPEATS}'})
+                                  'threshold':round(float(np.mean(tk_a2_thr)),4),
+                                  'notes':f'mean over {N_REPEATS}'})
 
 # ── A3 conditions ─────────────────────────────────────────────────────────
 for pn, (sc, y6) in A3_PICKS.items():
@@ -1165,9 +1201,13 @@ if len(a3_topk_rows) > 0:
         if not sub: continue
         r = sub[0]
         summary_rows.append({'condition':'A3_topk','pick_name':pn,'region':'overall',
-                              'F1':r['topk_f1_mean'],'P':float('nan'),'R':float('nan'),
-                              'AUC':float('nan'),'n_pos':float('nan'),'n_eval':float('nan'),
-                              'threshold':float('nan'),'notes':f'mean over {N_REPEATS}'})
+                              'F1':r['topk_f1_mean'],
+                              'P':r.get('topk_prec_mean', float('nan')),
+                              'R':r.get('topk_rec_mean',  float('nan')),
+                              'AUC':r.get('topk_auc',     float('nan')),
+                              'n_pos':float('nan'),'n_eval':float('nan'),
+                              'threshold':r.get('topk_thr_mean', float('nan')),
+                              'notes':f'mean over {N_REPEATS}'})
 
 # ── Combined A2+A3 ────────────────────────────────────────────────────────
 comb_path = SAVE_DIR / 'combined_topk_results.csv'
@@ -1175,9 +1215,12 @@ if comb_path.exists():
     comb_r = pd.read_csv(comb_path).iloc[0]
     summary_rows.append({'condition':'A2A3_combined_topk','pick_name':'aug_best+pseudo',
                           'region':'overall','F1':comb_r['topk_f1_mean'],
-                          'P':float('nan'),'R':float('nan'),'AUC':float('nan'),
+                          'P':comb_r.get('topk_prec_mean', float('nan')),
+                          'R':comb_r.get('topk_rec_mean',  float('nan')),
+                          'AUC':comb_r.get('topk_auc',     float('nan')),
                           'n_pos':float('nan'),'n_eval':float('nan'),
-                          'threshold':float('nan'),'notes':f'±{comb_r["topk_f1_std"]:.4f}'})
+                          'threshold':comb_r.get('topk_thr_mean', float('nan')),
+                          'notes':f'±{comb_r["topk_f1_std"]:.4f}'})
 
 # ── assemble & print ──────────────────────────────────────────────────────
 SUMMARY = pd.DataFrame(summary_rows)

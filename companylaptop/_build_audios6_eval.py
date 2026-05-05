@@ -47,11 +47,11 @@ BATCH_NEW       = 'audios6'
 TRAIN_BATCHES_A = ['audios2', 'audios4']            # Mode A — preserves rotation A
 TRAIN_BATCHES_B = ['audios2', 'audios4', 'audios5'] # Mode B — adds a5
 
-PICK_TOP_N      = 3
+PICK_TOP_N      = 20
 PICK_RANK_BY    = 'te_f1'   # column in summary_avg.csv to rank by
 PICK_ROTATION   = 'A'
 PICK_STRATEGY   = 'F1'      # only F1 strategy is in scope here
-EXP_TOP_N       = 3         # Section 2: top-K to detail per ranking (cv_f1 legit + a6_f1 cherry-pick)
+EXP_TOP_N       = 20        # Section 2: top-K to detail per ranking (cv_f1 legit + a6_f1 cherry-pick)
 
 MIN_SPEAKING_S  = 30
 N_FOLDS         = 5
