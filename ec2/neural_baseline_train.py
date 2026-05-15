@@ -1,24 +1,69 @@
-"""
-EC2 (T4) baseline neural training for per-audio cheating detection.
+"""Per-audio cheating classifier training (Stage 0 of NEURAL_PLAN.md).
 
-Pipeline:
-    1. Load gt.csv + audio_npy/ produced by companylaptop/neural_baseline_prep.py.
-    2. Extract WavLM-base-plus mean-pooled (768d) and Whisper-medium encoder
-       mean-pooled (1024d) embeddings. Concatenate -> 1792d. Cache to disk.
-    3. Speaker-wise stratified split: 60% train / 20% val / 20% test
-       (no group_id leak across splits).
-    4. For each variant in {none, pca98, pca95, pca90}: train MLP, evaluate on
-       held-out test split, write predictions and metrics.
-    5. Print + save a summary table comparing variants.
+Loads pre-extracted frozen embeddings from embeddings_cache.npz (run
+extract_embeddings.py once first). For each iteration the script trains a
+fresh MLP head on the concatenation of:
+
+    WavLM-base-plus mean-pool (768) + Whisper-medium encoder mean-pool (1024)
+    + handcrafted feat_* features from gt.csv
+
+feat_* columns are concatenated BEFORE standardization and PCA, so every
+variant (including pca90) trains on a compressed representation that still
+contains the text features.
+
+Variant matrix (20 = 2 archs x 2 WavLM layers x 5 PCA settings):
+
+    architectures:
+        default = 512 -> 256 -> 128 -> 1, dropout 0.40, wd 5e-4
+        tiny    = 128 -> 1,                dropout 0.55, wd 5e-3
+
+    WavLM layer:
+        last  encoder output (the standard mean-pool baseline)
+        l9    hidden_states[9] -- often best for paralinguistic tasks
+
+    PCA on standardized concat:
+        full   no PCA (control)
+        pca98  keep 98% variance
+        pca95  keep 95% variance
+        pca93  keep 93% variance
+        pca90  keep 90% variance
+
+Standardizer and PCA are fit per-layer on the (possibly aug-expanded) train
+set only and reused across all 5 PCA settings for that layer.
+
+Split modes:
+    Mode A (no --test_batches): StratifiedGroupKFold(5) on (train_batches minus
+        --train_only_batches). fold0 = test, fold1 = val, folds 2-4 = train.
+        --train_only_batches rows are appended to train after the split.
+    Mode B (--test_batches set): test = those batches (optionally region-filtered).
+        Train pool = (train_batches minus train_only_batches) minus candidates
+        leaking into test. Val drawn from same-region subset when possible.
+        --train_only_batches rows are appended to train.
+
+ALLSTAR support: by default --train_only_batches=2676,2677 so the ALLSTAR
+auxiliary batches segment-split by neural_baseline_prep.py are never placed
+in val or test. They contribute supervised acoustic signal to train only.
+
+Optional --use_augs:
+    Augmentation expands the TRAINING matrix only; val/test always use 'orig'
+    embeddings. Pass 'all' to use every aug present in the cache, or a CSV
+    of names (e.g. 'noise,pitch,vtlp'). Empty = no augs.
+
+Optional --min_duration:
+    Drops any row with duration_sec < threshold from BOTH train and test
+    before splits are built. Reduces label noise from very short clips.
 
 Run:
-    python neural_baseline_train.py \
-        --data_dir /path/to/upload \
-        --out_dir  /path/to/results \
-        --batch_size 64 --epochs 60
-
-The first run does encoder extraction (slow). Subsequent runs reuse the cache
-in --out_dir/embeddings_cache.npz.
+    python neural_baseline_train.py \\
+        --data_dir /path/to/upload \\
+        --out_dir  /path/to/results/run1 \\
+        --cache    /path/to/embeddings_cache.npz \\
+        --train_batches audios2,audios4,audios5,2676,2677 \\
+        --test_batches  audios6 \\
+        --test_region_filter IND \\
+        --train_only_batches 2676,2677 \\
+        --min_duration 5.0 \\
+        --use_augs noise,pitch,vtlp,combo
 """
 
 from __future__ import annotations
@@ -27,7 +72,6 @@ import argparse
 import json
 import logging
 import sys
-import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -36,50 +80,52 @@ import pandas as pd
 import torch
 import torch.nn as nn
 from sklearn.decomposition import PCA
-from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import (average_precision_score, f1_score,
                              precision_recall_curve,
                              precision_recall_fscore_support, roc_auc_score)
 from sklearn.model_selection import StratifiedGroupKFold
+from sklearn.preprocessing import StandardScaler
 from torch.utils.data import DataLoader, TensorDataset
-from tqdm import tqdm
-from transformers import (AutoFeatureExtractor, WavLMModel, WhisperFeatureExtractor,
-                          WhisperModel)
 
 # ----------------------------------------------------------------------------
-# Defaults / model identifiers
+# Variants.
 # ----------------------------------------------------------------------------
 
-WAVLM_ID = "microsoft/wavlm-base-plus"
-WHISPER_ID = "openai/whisper-medium"
-
-WAVLM_CHUNK_SEC = 20.0   # WavLM has no fixed length but we chunk to control VRAM
-WHISPER_CHUNK_SEC = 30.0  # Whisper is hard-coded to 30s windows
-TARGET_SR = 16000
-
-# Architectures. Tuned for the small-sample regime (~1000 labels): heavy
-# dropout, larger weight decay, label smoothing, gradient clipping all
-# enabled in train_one. The "tiny" variant is a single hidden layer with
-# very strong regularization, intended as a hard-to-overfit baseline.
 ARCH_CONFIG: dict[str, dict] = {
     "default": {"hidden": (512, 256, 128), "dropout": 0.40, "weight_decay": 5e-4},
     "tiny":    {"hidden": (128,),          "dropout": 0.55, "weight_decay": 5e-3},
 }
 
-# (variant_name, pca_variance_or_None, arch_name)
-VARIANTS_CONFIG: list[tuple[str, float | None, str]] = [
-    ("none",  None, "default"),
-    ("pca98", 0.98, "default"),
-    ("pca95", 0.95, "default"),
-    ("pca90", 0.90, "default"),
-    ("tiny",  None, "tiny"),
+PCA_VARIANTS: list[tuple[str, float | None]] = [
+    ("full",  None),
+    ("pca98", 0.98),
+    ("pca95", 0.95),
+    ("pca93", 0.93),
+    ("pca90", 0.90),
 ]
+
+# WavLM layer choices. 'last' = last hidden state (encoder output);
+# '9' = hidden_states[9], typically the strongest layer for paralinguistics.
+WAVLM_LAYERS: list[str] = ["last", "9"]
+
 LABEL_SMOOTHING = 0.05
 GRAD_CLIP_NORM = 1.0
 
 
+def make_variants() -> list[tuple[str, str, str, float | None]]:
+    """20 (variant_name, arch_name, wavlm_layer, pca_var) tuples =
+    2 archs x 2 layers x 5 PCA settings."""
+    out = []
+    for arch in ARCH_CONFIG.keys():
+        for layer in WAVLM_LAYERS:
+            layer_tag = layer if layer == "last" else f"l{layer}"
+            for pca_name, pca_val in PCA_VARIANTS:
+                out.append((f"{arch}_{layer_tag}_{pca_name}", arch, layer, pca_val))
+    return out
+
+
 # ----------------------------------------------------------------------------
-# Logging
+# Logging.
 # ----------------------------------------------------------------------------
 
 def setup_logging(log_path: Path) -> logging.Logger:
@@ -98,94 +144,7 @@ def setup_logging(log_path: Path) -> logging.Logger:
 
 
 # ----------------------------------------------------------------------------
-# Embedding extraction
-# ----------------------------------------------------------------------------
-
-@torch.no_grad()
-def extract_wavlm_meanpool(wav: np.ndarray, model: WavLMModel, device: torch.device) -> np.ndarray:
-    """Chunk a 16kHz mono waveform, run WavLM, mean-pool last hidden state across all
-    frames of all chunks. Returns (768,) float32."""
-    chunk = int(WAVLM_CHUNK_SEC * TARGET_SR)
-    if len(wav) <= chunk:
-        chunks = [wav]
-    else:
-        chunks = [wav[i:i + chunk] for i in range(0, len(wav), chunk)]
-    pooled = []
-    weights = []
-    for c in chunks:
-        if len(c) < TARGET_SR * 0.4:  # under 0.4s = noise
-            continue
-        x = torch.from_numpy(c).float().unsqueeze(0).to(device)
-        out = model(x).last_hidden_state  # (1, T, 768)
-        pooled.append(out.mean(dim=1).squeeze(0).cpu().numpy())
-        weights.append(out.shape[1])
-    if not pooled:
-        return np.zeros(model.config.hidden_size, dtype=np.float32)
-    P = np.stack(pooled, axis=0)
-    W = np.array(weights, dtype=np.float32)
-    return (P * (W[:, None] / W.sum())).sum(axis=0).astype(np.float32)
-
-
-@torch.no_grad()
-def extract_whisper_meanpool(wav: np.ndarray, model: WhisperModel,
-                             feat: WhisperFeatureExtractor, device: torch.device) -> np.ndarray:
-    """Chunk to 30s windows, run Whisper encoder, mean-pool over time across all
-    chunks. Returns (1024,) float32 for whisper-medium."""
-    chunk = int(WHISPER_CHUNK_SEC * TARGET_SR)
-    if len(wav) <= chunk:
-        chunks = [wav]
-    else:
-        chunks = [wav[i:i + chunk] for i in range(0, len(wav), chunk)]
-    pooled = []
-    for c in chunks:
-        if len(c) < TARGET_SR * 0.4:
-            continue
-        # Whisper feature extractor pads/truncates to 30s automatically.
-        feats = feat(c, sampling_rate=TARGET_SR, return_tensors="pt").input_features.to(device)
-        enc = model.encoder(feats).last_hidden_state  # (1, T_enc, 1024)
-        pooled.append(enc.mean(dim=1).squeeze(0).cpu().numpy())
-    if not pooled:
-        return np.zeros(model.config.d_model, dtype=np.float32)
-    return np.stack(pooled, axis=0).mean(axis=0).astype(np.float32)
-
-
-def extract_all_embeddings(gt: pd.DataFrame, npy_dir: Path, device: torch.device,
-                           log: logging.Logger) -> tuple[np.ndarray, np.ndarray]:
-    log.info("Loading WavLM (%s)...", WAVLM_ID)
-    wavlm = WavLMModel.from_pretrained(WAVLM_ID).to(device).eval()
-    log.info("Loading Whisper-medium (%s)...", WHISPER_ID)
-    whisper = WhisperModel.from_pretrained(WHISPER_ID).to(device).eval()
-    whisper_feat = WhisperFeatureExtractor.from_pretrained(WHISPER_ID)
-
-    wavlm_dim = wavlm.config.hidden_size
-    whisper_dim = whisper.config.d_model
-    log.info("WavLM dim = %d, Whisper dim = %d, concat = %d", wavlm_dim, whisper_dim,
-             wavlm_dim + whisper_dim)
-
-    wavlm_emb = np.zeros((len(gt), wavlm_dim), dtype=np.float32)
-    whisper_emb = np.zeros((len(gt), whisper_dim), dtype=np.float32)
-
-    t0 = time.time()
-    for i, row in tqdm(list(gt.iterrows()), desc="extract", unit="audio"):
-        path = npy_dir / row["npy_filename"]
-        try:
-            wav = np.load(path).astype(np.float32, copy=False)
-        except Exception as e:
-            log.warning("Failed to load %s: %s -- using zeros", path, e)
-            continue
-        wavlm_emb[i] = extract_wavlm_meanpool(wav, wavlm, device)
-        whisper_emb[i] = extract_whisper_meanpool(wav, whisper, whisper_feat, device)
-
-    log.info("Extraction done in %.1f s", time.time() - t0)
-
-    # Free GPU.
-    del wavlm, whisper
-    torch.cuda.empty_cache()
-    return wavlm_emb, whisper_emb
-
-
-# ----------------------------------------------------------------------------
-# Splits
+# Splits.
 # ----------------------------------------------------------------------------
 
 def _kfold_indices(y: np.ndarray, g: np.ndarray, n_splits: int, seed: int) -> list[np.ndarray]:
@@ -196,26 +155,27 @@ def _kfold_indices(y: np.ndarray, g: np.ndarray, n_splits: int, seed: int) -> li
 def build_splits(gt: pd.DataFrame, train_batches: list[str],
                  test_batches: list[str] | None,
                  test_region_filter: str | None,
-                 seed: int = 42, log: logging.Logger | None = None) -> dict[str, np.ndarray]:
-    """Build train/val/test row-index arrays into the original gt frame.
+                 train_only_batches: list[str],
+                 seed: int, log: logging.Logger) -> dict[str, np.ndarray]:
+    """train_only_batches: batches whose rows are forced into the train split
+    only -- never appear in val/test. Their group_ids are also stripped from
+    the candidate-leak check (they're already disjoint by construction)."""
+    train_only_set = set(train_only_batches or [])
+    train_only_mask = gt["batch"].isin(train_only_set).to_numpy() if train_only_set else np.zeros(len(gt), dtype=bool)
+    train_only_idx = np.where(train_only_mask)[0]
+    if len(train_only_idx):
+        log.info("train_only rows (auxiliary, forced to train): %d (batches=%s)",
+                 len(train_only_idx), sorted(train_only_set))
 
-    Two modes:
-      A) test_batches is None or empty -> filter gt to train_batches, then
-         StratifiedGroupKFold(5): fold 0 = test (~20%), fold 1 = val (~20%),
-         folds 2-4 = train (~60%). Speaker-disjoint, label-stratified.
-      B) test_batches non-empty -> test = gt rows in those batches (optionally
-         filtered by region == test_region_filter). Train pool = gt rows in
-         train_batches; val is StratifiedGroupKFold(5) fold 0 of train pool;
-         remainder is train. Any train-pool row whose group_id appears in test
-         is dropped from train+val (defensive against shared candidates).
-    """
-    log = log or logging.getLogger("train")
-    train_mask = gt["batch"].isin(train_batches).to_numpy()
+    # The CV/split pool excludes train_only.
+    train_pool_batches = [b for b in train_batches if b not in train_only_set]
+    pool_mask = gt["batch"].isin(train_pool_batches).to_numpy()
 
     if not test_batches:
-        sub = gt[train_mask].reset_index().rename(columns={"index": "_orig"})
+        sub = gt[pool_mask].reset_index().rename(columns={"index": "_orig"})
         if len(sub) == 0:
-            raise ValueError(f"No rows match train_batches={train_batches}")
+            raise ValueError(f"No rows match train_batches={train_pool_batches} "
+                             f"(after excluding train_only={sorted(train_only_set)})")
         folds = _kfold_indices(sub["label"].to_numpy(), sub["group_id"].to_numpy(),
                                n_splits=5, seed=seed)
         test_local = folds[0]
@@ -223,12 +183,13 @@ def build_splits(gt: pd.DataFrame, train_batches: list[str],
         used = set(test_local) | set(val_local)
         train_local = np.array([i for i in range(len(sub)) if i not in used])
         to_orig = sub["_orig"].to_numpy()
-        log.info("Split mode A: 60/20/20 candidate-wise on %s", train_batches)
-        return {"train": to_orig[train_local],
+        train_idx = np.concatenate([to_orig[train_local], train_only_idx])
+        log.info("Split mode A: 60/20/20 candidate-wise on %s  + %d train_only rows",
+                 train_pool_batches, len(train_only_idx))
+        return {"train": train_idx,
                 "val":   to_orig[val_local],
                 "test":  to_orig[test_local]}
 
-    # Mode B: explicit test batches.
     test_mask = gt["batch"].isin(test_batches).to_numpy()
     if test_region_filter:
         if "region" not in gt.columns:
@@ -240,31 +201,25 @@ def build_splits(gt: pd.DataFrame, train_batches: list[str],
         raise ValueError(f"No test rows match batches={test_batches} region={test_region_filter}")
 
     test_groups = set(gt.iloc[test_idx]["group_id"].tolist())
-    train_pool_mask = train_mask & ~gt["group_id"].isin(test_groups).to_numpy() & ~test_mask
-    sub = gt[train_pool_mask].reset_index().rename(columns={"index": "_orig"})
+    eligible_mask = pool_mask & ~gt["group_id"].isin(test_groups).to_numpy() & ~test_mask
+    sub = gt[eligible_mask].reset_index().rename(columns={"index": "_orig"})
     if len(sub) == 0:
-        raise ValueError(f"No train-pool rows after excluding test groups; train_batches={train_batches}")
+        raise ValueError(f"No train-pool rows after excluding test groups; "
+                         f"train_pool_batches={train_pool_batches}")
 
-    # If test is region-filtered, prefer val from same region so early stopping
-    # tracks the distribution we actually care about. Fall back to unfiltered
-    # val if same-region pool is too small or single-class.
     val_local: np.ndarray | None = None
     if test_region_filter and "region" in gt.columns:
         same_region_mask = (sub["region"].astype(str) == test_region_filter).to_numpy()
         if same_region_mask.sum() >= 30 and len(np.unique(sub.loc[same_region_mask, "label"])) == 2:
             sub_r = sub[same_region_mask].reset_index(drop=True)
             r_folds = _kfold_indices(sub_r["label"].to_numpy(),
-                                     sub_r["group_id"].to_numpy(),
-                                     n_splits=5, seed=seed)
-            sub_r_local = r_folds[0]
-            # Map sub_r positions back to positions inside sub.
+                                     sub_r["group_id"].to_numpy(), n_splits=5, seed=seed)
             sub_r_to_sub = np.where(same_region_mask)[0]
-            val_local = sub_r_to_sub[sub_r_local]
+            val_local = sub_r_to_sub[r_folds[0]]
             log.info("Mode B val: drawn from region=%s subset of train pool (n=%d)",
                      test_region_filter, len(val_local))
         else:
-            log.warning("Mode B: region=%s subset of train pool too small or single-class; "
-                        "falling back to mixed-region val (early stopping may track wrong distribution)",
+            log.warning("Mode B: region=%s subset too small or single-class -- using mixed val",
                         test_region_filter)
 
     if val_local is None:
@@ -274,9 +229,10 @@ def build_splits(gt: pd.DataFrame, train_batches: list[str],
 
     train_local = np.array([i for i in range(len(sub)) if i not in set(val_local)])
     to_orig = sub["_orig"].to_numpy()
-    log.info("Split mode B: train=%s test=%s region_filter=%s",
-             train_batches, test_batches, test_region_filter)
-    return {"train": to_orig[train_local],
+    train_idx = np.concatenate([to_orig[train_local], train_only_idx])
+    log.info("Split mode B: train=%s test=%s region_filter=%s  + %d train_only rows",
+             train_pool_batches, test_batches, test_region_filter, len(train_only_idx))
+    return {"train": train_idx,
             "val":   to_orig[val_local],
             "test":  test_idx}
 
@@ -289,7 +245,7 @@ def assert_no_group_leak(gt: pd.DataFrame, splits: dict[str, np.ndarray]) -> Non
 
 
 # ----------------------------------------------------------------------------
-# MLP
+# MLP.
 # ----------------------------------------------------------------------------
 
 class MLP(nn.Module):
@@ -309,8 +265,6 @@ class MLP(nn.Module):
 
 def smoothed_bce_logits(logits: torch.Tensor, target: torch.Tensor,
                         smoothing: float, pos_weight: torch.Tensor) -> torch.Tensor:
-    """BCE-with-logits with symmetric binary label smoothing.
-    target=1 -> 1 - smoothing/2,  target=0 -> smoothing/2."""
     if smoothing > 0:
         target = target * (1.0 - smoothing) + 0.5 * smoothing
     return nn.functional.binary_cross_entropy_with_logits(logits, target, pos_weight=pos_weight)
@@ -326,17 +280,30 @@ class TrainResult:
 def train_one(X_tr, y_tr, X_va, y_va, X_te, y_te, *, in_dim: int, batch_size: int,
               epochs: int, lr: float, wd: float, device: torch.device,
               log: logging.Logger, tag: str,
-              hidden: tuple = (512, 256, 128), dropout: float = 0.4,
+              hidden: tuple, dropout: float,
               label_smoothing: float = LABEL_SMOOTHING,
               grad_clip: float = GRAD_CLIP_NORM,
-              patience: int = 10) -> tuple["TrainResult", np.ndarray]:
+              patience: int = 10,
+              class_balance: str = "sampler") -> tuple[TrainResult, np.ndarray]:
+    """class_balance:
+        'sampler'    WeightedRandomSampler so each minibatch is class-balanced
+                     in expectation (default; replaces pos_weight)
+        'pos_weight' BCE pos_weight = neg/pos, natural shuffling
+        'both'       sampler + pos_weight (rare; usually over-corrects)
+        'none'       natural distribution, no correction (sanity check)
+    """
     pos = float((y_tr == 1).sum())
     neg = float((y_tr == 0).sum())
-    pos_weight = torch.tensor([neg / max(pos, 1.0)], device=device)
-    log.info("[%s] arch hidden=%s dropout=%.2f wd=%.1e ls=%.2f clip=%.1f",
-             tag, hidden, dropout, wd, label_smoothing, grad_clip)
-    log.info("[%s] train n=%d (pos=%d/neg=%d, pw=%.2f)  val n=%d  test n=%d  in_dim=%d",
-             tag, len(y_tr), int(pos), int(neg), pos_weight.item(), len(y_va), len(y_te), in_dim)
+    total = max(pos + neg, 1.0)
+    if class_balance in ("pos_weight", "both"):
+        pos_weight = torch.tensor([neg / max(pos, 1.0)], device=device)
+    else:
+        pos_weight = torch.tensor([1.0], device=device)
+    log.info("[%s] arch hidden=%s dropout=%.2f wd=%.1e ls=%.2f clip=%.1f balance=%s",
+             tag, hidden, dropout, wd, label_smoothing, grad_clip, class_balance)
+    log.info("[%s] train n=%d  pos=%d (%.1f%%)  neg=%d (%.1f%%)  pw=%.2f  val n=%d  test n=%d  in_dim=%d",
+             tag, len(y_tr), int(pos), 100 * pos / total, int(neg), 100 * neg / total,
+             pos_weight.item(), len(y_va), len(y_te), in_dim)
 
     model = MLP(in_dim, hidden=hidden, dropout=dropout).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
@@ -346,10 +313,20 @@ def train_one(X_tr, y_tr, X_va, y_va, X_te, y_te, *, in_dim: int, batch_size: in
         return TensorDataset(torch.from_numpy(X.astype(np.float32)),
                              torch.from_numpy(y.astype(np.float32)))
 
-    # drop_last=True so a final batch of size 1 doesn't crash BatchNorm during
-    # training. eval/predict path doesn't use BN running-stats updates so it's safe.
-    tr_loader = DataLoader(to_tensor(X_tr, y_tr), batch_size=batch_size,
-                           shuffle=True, drop_last=True)
+    if class_balance in ("sampler", "both") and pos > 0 and neg > 0:
+        # per-sample weight = 1 / count_of_its_class -> equal probability for
+        # each class in expectation. num_samples=len(y_tr) so an epoch still
+        # sees ~one-pass worth of gradients (just with reweighted draws).
+        cls_counts = np.array([neg, pos], dtype=np.float64)
+        per_sample_w = (1.0 / cls_counts[y_tr.astype(np.int64)]).astype(np.float64)
+        sampler = torch.utils.data.WeightedRandomSampler(
+            weights=per_sample_w.tolist(), num_samples=len(y_tr), replacement=True,
+        )
+        tr_loader = DataLoader(to_tensor(X_tr, y_tr), batch_size=batch_size,
+                               sampler=sampler, drop_last=True)
+    else:
+        tr_loader = DataLoader(to_tensor(X_tr, y_tr), batch_size=batch_size,
+                               shuffle=True, drop_last=True)
 
     @torch.no_grad()
     def predict(X):
@@ -379,7 +356,7 @@ def train_one(X_tr, y_tr, X_va, y_va, X_te, y_te, *, in_dim: int, batch_size: in
             opt.step()
             ep_loss += loss.item() * xb.size(0)
         sched.step()
-        ep_loss /= len(y_tr)
+        ep_loss /= max(len(y_tr), 1)
 
         val_p = predict(X_va)
         val_f1 = f1_score(y_va, (val_p >= 0.5).astype(int), zero_division=0)
@@ -392,11 +369,11 @@ def train_one(X_tr, y_tr, X_va, y_va, X_te, y_te, *, in_dim: int, batch_size: in
             patience_left -= 1
 
         if ep % 5 == 0 or ep == 1:
-            log.info("[%s] ep %3d  loss %.4f  val_f1 %.4f  best %.4f@%d", tag, ep, ep_loss,
-                     val_f1, best_val_f1, best_epoch)
+            log.info("[%s] ep %3d  loss %.4f  val_f1 %.4f  best %.4f@%d",
+                     tag, ep, ep_loss, val_f1, best_val_f1, best_epoch)
         if patience_left <= 0:
-            log.info("[%s] early stop at ep %d (best val_f1 %.4f @ ep %d)", tag, ep,
-                     best_val_f1, best_epoch)
+            log.info("[%s] early stop at ep %d (best val_f1 %.4f @ ep %d)",
+                     tag, ep, best_val_f1, best_epoch)
             break
 
     if best_state is not None:
@@ -404,8 +381,12 @@ def train_one(X_tr, y_tr, X_va, y_va, X_te, y_te, *, in_dim: int, batch_size: in
 
     test_p = predict(X_te)
     metrics = compute_metrics(y_te, test_p)
-    return TrainResult(best_val_f1=best_val_f1, best_epoch=best_epoch, test_metrics=metrics), test_p
+    return TrainResult(best_val_f1, best_epoch, metrics), test_p
 
+
+# ----------------------------------------------------------------------------
+# Metrics.
+# ----------------------------------------------------------------------------
 
 def compute_metrics(y_true: np.ndarray, p: np.ndarray) -> dict:
     out: dict = {}
@@ -413,20 +394,18 @@ def compute_metrics(y_true: np.ndarray, p: np.ndarray) -> dict:
     out["n_pos"] = int((y_true == 1).sum())
     out["n_neg"] = int((y_true == 0).sum())
 
-    # Threshold = 0.5
     yhat = (p >= 0.5).astype(int)
     pr, rc, f1, _ = precision_recall_fscore_support(y_true, yhat, average="binary", zero_division=0)
     out["thr0.5"] = {"precision": float(pr), "recall": float(rc), "f1": float(f1)}
 
-    # Best-F1 threshold sweep
     thrs = np.linspace(0.05, 0.95, 91)
     f1s = [f1_score(y_true, (p >= t).astype(int), zero_division=0) for t in thrs]
     best_t = float(thrs[int(np.argmax(f1s))])
     yhat = (p >= best_t).astype(int)
     pr, rc, f1, _ = precision_recall_fscore_support(y_true, yhat, average="binary", zero_division=0)
-    out["best_f1"] = {"threshold": best_t, "precision": float(pr), "recall": float(rc), "f1": float(f1)}
+    out["best_f1"] = {"threshold": best_t, "precision": float(pr),
+                     "recall": float(rc), "f1": float(f1)}
 
-    # Top-K% rank rule, K matched to base rate
     base_rate = float(np.mean(y_true == 1))
     if base_rate > 0:
         k = max(1, int(round(base_rate * len(y_true))))
@@ -444,14 +423,9 @@ def compute_metrics(y_true: np.ndarray, p: np.ndarray) -> dict:
         out["auc"] = float("nan")
         out["ap"] = float("nan")
 
-    # Recall at fixed precision targets. precision_recall_curve returns
-    # arrays where precision[i]/recall[i] correspond to thresholds[i] (and an
-    # extra final point precision=1.0/recall=0.0). For each target we pick
-    # the operating point with precision >= target that maximises recall.
     rap: dict[str, dict] = {}
     try:
         prec, rec, thr = precision_recall_curve(y_true, p)
-        # Drop the trailing (precision=1, recall=0) sentinel that has no threshold.
         prec_t = prec[:-1]
         rec_t = rec[:-1]
         for target in (0.50, 0.80, 0.90, 0.95):
@@ -480,7 +454,6 @@ def compute_metrics(y_true: np.ndarray, p: np.ndarray) -> dict:
                 "threshold": float("nan"),
             }
     out["recall_at_precision"] = rap
-
     return out
 
 
@@ -500,227 +473,367 @@ def per_slice_metrics(y_true: np.ndarray, p: np.ndarray, slice_vals: np.ndarray,
 
 
 # ----------------------------------------------------------------------------
-# Main
+# Cache helpers.
+# ----------------------------------------------------------------------------
+
+def load_cache_reindexed(cache_path: Path, filenames_cur: np.ndarray,
+                         aug_names_needed: list[str], layers_needed: list[str],
+                         log: logging.Logger
+                         ) -> tuple[dict[tuple[str, str], np.ndarray],
+                                    dict[str, np.ndarray]]:
+    """Returns (wavlm_by_layer_aug, whisper_by_aug), both aligned to filenames_cur.
+
+    Old caches (no 'wavlm_layers' key) are read as if they held only 'last'.
+    """
+    if not cache_path.exists():
+        raise FileNotFoundError(
+            f"No embedding cache at {cache_path}. Run extract_embeddings.py first.")
+    cache = dict(np.load(cache_path, allow_pickle=True))
+    cached_filenames = cache["filenames"].astype(str)
+    cached_augs = list(cache["aug_names"].astype(str))
+    if "wavlm_layers" in cache:
+        cached_layers = list(cache["wavlm_layers"].astype(str))
+    else:
+        cached_layers = ["last"]
+        for a in cached_augs:
+            if f"wavlm_{a}" in cache and f"wavlm_last_{a}" not in cache:
+                cache[f"wavlm_last_{a}"] = cache[f"wavlm_{a}"]
+    log.info("cache: %d filenames, augs=%s, layers=%s",
+             len(cached_filenames), cached_augs, cached_layers)
+
+    missing_augs = [a for a in aug_names_needed if a not in cached_augs]
+    if missing_augs:
+        raise ValueError(
+            f"Augs requested but not in cache: {missing_augs}. "
+            f"Cache has: {cached_augs}. Re-run extract_embeddings.py.")
+    missing_layers = [l for l in layers_needed if l not in cached_layers]
+    if missing_layers:
+        raise ValueError(
+            f"WavLM layers requested but not in cache: {missing_layers}. "
+            f"Cache has: {cached_layers}. Re-run extract_embeddings.py with "
+            f"--wavlm_layers including those.")
+
+    f2c = {f: i for i, f in enumerate(cached_filenames)}
+    missing_files = [f for f in filenames_cur if f not in f2c]
+    if missing_files:
+        raise ValueError(
+            f"{len(missing_files)} gt rows have npy_filename not in the cache. "
+            f"First few: {missing_files[:5]}. Re-run extract_embeddings.py.")
+
+    order = np.array([f2c[f] for f in filenames_cur])
+    wavlm_out: dict[tuple[str, str], np.ndarray] = {}
+    whisper_out: dict[str, np.ndarray] = {}
+    for layer in layers_needed:
+        for a in aug_names_needed:
+            wavlm_out[(layer, a)] = cache[f"wavlm_{layer}_{a}"][order]
+    for a in aug_names_needed:
+        whisper_out[a] = cache[f"whisper_{a}"][order]
+    return wavlm_out, whisper_out
+
+
+def resolve_use_augs(use_augs_arg: str, cache_path: Path,
+                     log: logging.Logger) -> list[str]:
+    """Parse --use_augs into a list of aug names that exist in the cache.
+    'all' = every aug in the cache except 'orig'. Empty -> []."""
+    s = use_augs_arg.strip()
+    if not s:
+        return []
+    cache = dict(np.load(cache_path, allow_pickle=True))
+    cached_augs = [a for a in cache["aug_names"].astype(str) if a != "orig"]
+    if s.lower() == "all":
+        log.info("--use_augs=all -> using every non-orig aug in cache: %s", cached_augs)
+        return cached_augs
+    wanted = [a.strip() for a in s.split(",") if a.strip() and a.strip() != "orig"]
+    missing = [a for a in wanted if a not in cached_augs]
+    if missing:
+        raise ValueError(f"--use_augs requested {missing} but cache has {cached_augs}. "
+                         f"Re-run extract_embeddings.py.")
+    return wanted
+
+
+# ----------------------------------------------------------------------------
+# Main.
 # ----------------------------------------------------------------------------
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--data_dir", required=True, help="folder containing gt.csv and audio_npy/")
-    ap.add_argument("--out_dir", required=True, help="where to write results")
-    ap.add_argument("--train_batches", default="audios2,audios4,audios5,audios6",
-                    help="comma-separated batch names used for training")
+    ap.add_argument("--data_dir", required=True,
+                    help="folder containing gt.csv and audio_npy/")
+    ap.add_argument("--out_dir", required=True)
+    ap.add_argument("--cache", default="",
+                    help="path to embeddings_cache.npz. Defaults to <data_dir>/embeddings_cache.npz.")
+    ap.add_argument("--train_batches", default="audios2,audios4,audios5,audios6,2676,2677")
     ap.add_argument("--test_batches", default="",
-                    help="comma-separated batch names for held-out test. "
-                         "Empty => 80/20 candidate-wise split on train_batches.")
+                    help="empty -> 60/20/20 candidate-wise split on train_batches")
     ap.add_argument("--test_region_filter", default="",
-                    help="when test_batches is set, restrict test to rows where "
-                         "region == this value (e.g. IND). Empty = no filter.")
+                    help="when test_batches set, restrict test to region == this")
+    ap.add_argument("--train_only_batches", default="2676,2677",
+                    help="comma-separated batches whose rows are forced into train "
+                         "only -- never appear in val/test. Default: ALLSTAR batches.")
+    ap.add_argument("--min_duration", type=float, default=0.0,
+                    help="drop rows with duration_sec < this from BOTH train and test")
+    ap.add_argument("--use_augs", default="",
+                    help="comma-separated aug names from the cache to add to TRAIN "
+                         "(val/test always use 'orig'). 'all' = every aug in cache. "
+                         "Empty (default) = no augs.")
     ap.add_argument("--batch_size", type=int, default=64)
     ap.add_argument("--epochs", type=int, default=60)
     ap.add_argument("--lr", type=float, default=1e-3)
-    ap.add_argument("--wd", type=float, default=1e-4)
     ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument("--force_extract", action="store_true",
-                    help="ignore embeddings_cache.npz and re-extract from audio")
+    ap.add_argument("--class_balance", default="sampler",
+                    choices=["sampler", "pos_weight", "both", "none"],
+                    help="how to handle class imbalance in train. "
+                         "'sampler' = WeightedRandomSampler (balanced minibatches; default). "
+                         "'pos_weight' = BCE pos_weight=neg/pos with natural shuffling. "
+                         "'both' = sampler + pos_weight (over-corrects; rarely needed). "
+                         "'none' = natural distribution, no correction.")
     args = ap.parse_args()
 
     train_batches = [b.strip() for b in args.train_batches.split(",") if b.strip()]
     test_batches = [b.strip() for b in args.test_batches.split(",") if b.strip()]
+    train_only_batches = [b.strip() for b in args.train_only_batches.split(",") if b.strip()]
     test_region_filter = args.test_region_filter.strip() or None
 
     data_dir = Path(args.data_dir)
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    cache_path = Path(args.cache) if args.cache else (data_dir / "embeddings_cache.npz")
 
     log = setup_logging(out_dir / "log.txt")
-    log.info("data_dir=%s  out_dir=%s", data_dir, out_dir)
-    log.info("device count: %d", torch.cuda.device_count())
+    log.info("data_dir = %s", data_dir)
+    log.info("out_dir  = %s", out_dir)
+    log.info("cache    = %s", cache_path)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    log.info("using device: %s", device)
+    log.info("device   = %s", device)
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
-    gt_path = data_dir / "gt.csv"
-    npy_dir = data_dir / "audio_npy"
-    gt = pd.read_csv(gt_path)
+    # ---- Load gt
+    gt = pd.read_csv(data_dir / "gt.csv")
     log.info("Loaded gt.csv: %d rows", len(gt))
 
-    # Robust label parsing: tolerate strings like "0"/"1"/"" or floats with NaN.
     gt["label"] = pd.to_numeric(gt["label"], errors="coerce")
     n_before = len(gt)
     gt = gt[gt["label"].isin([0, 1])].copy()
     gt["label"] = gt["label"].astype(int)
     gt = gt.reset_index(drop=True)
-    log.info("Filtered to labeled rows (label in {0,1}): %d -> %d", n_before, len(gt))
+    log.info("Filtered to {0,1} labels: %d -> %d", n_before, len(gt))
 
-    requested_train = set(train_batches)
-    requested_test = set(test_batches)
-    in_either = gt["batch"].isin(requested_train | requested_test)
-    n_unused = int((~in_either).sum())
-    if n_unused:
-        log.warning("%d gt rows are not in train_batches or test_batches and will be unused (batches present: %s)",
-                    n_unused, sorted(gt.loc[~in_either, "batch"].unique().tolist()))
-    log.info("Label dist: %s", gt["label"].value_counts().to_dict())
-    if "region" in gt.columns and gt["region"].notna().any():
-        log.info("Region dist: %s", gt["region"].value_counts(dropna=False).to_dict())
-    if "batch" in gt.columns:
-        log.info("Batch dist: %s", gt["batch"].value_counts().to_dict())
-
-    cache_path = out_dir / "embeddings_cache.npz"
-    use_cache = cache_path.exists() and not args.force_extract
-    if use_cache:
-        cache = np.load(cache_path)
-        cached_filenames = cache["filenames"].astype(str)
-        # Build a lookup so we can re-index the cache to current gt order even
-        # if the gt was filtered differently between runs.
-        f2idx = {f: i for i, f in enumerate(cached_filenames)}
-        cur_files = gt["npy_filename"].to_numpy()
-        missing = [f for f in cur_files if f not in f2idx]
-        if missing:
-            log.warning("Cache is missing %d filenames in current gt; re-extracting fully", len(missing))
-            wavlm_emb, whisper_emb = extract_all_embeddings(gt, npy_dir, device, log)
-            np.savez(cache_path, wavlm=wavlm_emb, whisper=whisper_emb, filenames=cur_files)
+    # ---- min_duration filter (applies to train + test before splits)
+    if args.min_duration > 0.0:
+        if "duration_sec" not in gt.columns:
+            log.warning("--min_duration set but gt has no duration_sec column; skipping filter")
         else:
-            order = np.array([f2idx[f] for f in cur_files])
-            wavlm_emb = cache["wavlm"][order]
-            whisper_emb = cache["whisper"][order]
-            log.info("Loaded cached embeddings from %s (reindexed to current gt order)", cache_path)
-    else:
-        wavlm_emb, whisper_emb = extract_all_embeddings(gt, npy_dir, device, log)
-        np.savez(cache_path, wavlm=wavlm_emb, whisper=whisper_emb,
-                 filenames=gt["npy_filename"].to_numpy())
-        log.info("Saved embedding cache to %s", cache_path)
+            n_before = len(gt)
+            gt = gt[pd.to_numeric(gt["duration_sec"], errors="coerce")
+                      .fillna(0.0) >= args.min_duration].reset_index(drop=True)
+            log.info("min_duration=%.2fs filter: %d -> %d rows",
+                     args.min_duration, n_before, len(gt))
+            if len(gt) == 0:
+                log.error("All rows filtered out by --min_duration")
+                return 1
 
-    # Pull handcrafted features (computed on the company laptop and written
-    # into gt.csv as feat_* columns -- text + pause + prosodic + voice quality
-    # if the v3 features.csv was used, or text-only via compute_text_features
-    # as a fallback). Numeric only; no PII.
+    # ---- Diagnostics
+    requested = set(train_batches) | set(test_batches)
+    n_unused = int((~gt["batch"].isin(requested)).sum())
+    if n_unused:
+        log.warning("%d rows are outside train/test args and will be unused", n_unused)
+    log.info("label dist : %s", gt["label"].value_counts().to_dict())
+    if "region" in gt.columns and gt["region"].notna().any():
+        log.info("region dist: %s", gt["region"].value_counts(dropna=False).to_dict())
+    log.info("batch dist : %s", gt["batch"].value_counts().to_dict())
+
+    # ---- Resolve augs (validated against cache)
+    use_augs = resolve_use_augs(args.use_augs, cache_path, log)
+    log.info("use_augs: %s", use_augs)
+    aug_names_needed = ["orig"] + use_augs
+
+    # ---- Load cache (both WavLM layers, plus each aug requested), aligned to gt order
+    filenames_cur = gt["npy_filename"].to_numpy().astype(str)
+    wavlm_cache, whisper_cache = load_cache_reindexed(
+        cache_path, filenames_cur, aug_names_needed, WAVLM_LAYERS, log)
+    log.info("Loaded cache: wavlm keys=%s  whisper keys=%s",
+             list(wavlm_cache.keys()), list(whisper_cache.keys()))
+
+    # ---- Handcrafted features
     feat_cols = [c for c in gt.columns if c.startswith("feat_")]
     if feat_cols:
         feat_block = gt[feat_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0)
         feat_arr = feat_block.to_numpy().astype(np.float32)
-        log.info("Handcrafted features detected (%d columns): first 10 = %s%s",
-                 len(feat_cols), feat_cols[:10],
-                 " ..." if len(feat_cols) > 10 else "")
-        X_full = np.concatenate([wavlm_emb, whisper_emb, feat_arr], axis=1).astype(np.float32)
-        log.info("Concat shape (wavlm + whisper + feats): %s", X_full.shape)
+        log.info("handcrafted feats: %d cols  first10=%s%s",
+                 len(feat_cols), feat_cols[:10], " ..." if len(feat_cols) > 10 else "")
     else:
-        log.info("No feat_* columns in gt.csv -- training on audio embeddings only")
-        X_full = np.concatenate([wavlm_emb, whisper_emb], axis=1).astype(np.float32)
-        log.info("Concat shape (wavlm + whisper): %s", X_full.shape)
-    y_full = gt["label"].to_numpy().astype(np.int64)
+        feat_arr = None
+        log.info("no feat_* columns -- audio embeddings only")
 
-    # Sanity: catch all-zero rows (extraction silently failed, returned zeros).
-    zero_rows = (np.abs(X_full).sum(axis=1) == 0)
-    if zero_rows.any():
-        log.warning("%d rows have all-zero embeddings (extraction failed). They will train/test as zeros.",
-                    int(zero_rows.sum()))
+    def concat(wavlm: np.ndarray, whisper: np.ndarray, feats: np.ndarray | None) -> np.ndarray:
+        parts = [wavlm, whisper]
+        if feats is not None:
+            parts.append(feats)
+        return np.concatenate(parts, axis=1).astype(np.float32)
+
+    y_full = gt["label"].to_numpy().astype(np.int64)
 
     # ---- Splits
     splits = build_splits(gt, train_batches=train_batches,
                           test_batches=test_batches if test_batches else None,
                           test_region_filter=test_region_filter,
+                          train_only_batches=train_only_batches,
                           seed=args.seed, log=log)
     assert_no_group_leak(gt, splits)
     for k, idx in splits.items():
         labels = y_full[idx]
-        log.info("split %-5s n=%4d  pos=%4d  neg=%4d  unique_groups=%4d",
-                 k, len(idx), int((labels == 1).sum()), int((labels == 0).sum()),
+        n_pos = int((labels == 1).sum())
+        n_neg = int((labels == 0).sum())
+        n_tot = max(len(idx), 1)
+        log.info("split %-5s n=%4d  pos=%4d (%.1f%%)  neg=%4d (%.1f%%)  groups=%4d",
+                 k, len(idx), n_pos, 100 * n_pos / n_tot,
+                 n_neg, 100 * n_neg / n_tot,
                  gt.iloc[idx]["group_id"].nunique())
+        if "batch" in gt.columns:
+            log.info("split %-5s batches: %s", k,
+                     gt.iloc[idx]["batch"].value_counts().to_dict())
+    log.info("--class_balance=%s will be applied to TRAIN minibatches "
+             "(val/test always use natural distribution)", args.class_balance)
 
-    summary_rows = []
+    train_idx = splits["train"]
+    val_idx = splits["val"]
+    test_idx = splits["test"]
+    feat_train = feat_arr[train_idx] if feat_arr is not None else None
+    y_train_base = y_full[train_idx]
+    y_val = y_full[val_idx]
+    y_test = y_full[test_idx]
 
-    # Per-feature standardization, fit ONLY on train. Applied to all splits.
-    # Important for an MLP on raw frozen-encoder embeddings (different feature
-    # scales = unstable optimization). PCA is fit on the standardized train.
-    scaler = StandardScaler().fit(X_full[splits["train"]])
-    X_full_std = scaler.transform(X_full).astype(np.float32)
+    # ---- Per-layer (X_train aug-expanded, X_val, X_test, scaler) ----
+    # We pre-build all features per WavLM layer once so the variant loop only
+    # has to fit PCA + MLP.
+    per_layer: dict[str, dict] = {}
+    for layer in WAVLM_LAYERS:
+        X_orig = concat(wavlm_cache[(layer, "orig")], whisper_cache["orig"], feat_arr)
+        zero_rows = (np.abs(X_orig).sum(axis=1) == 0)
+        if zero_rows.any():
+            log.warning("[layer=%s] %d rows have all-zero orig embeddings",
+                        layer, int(zero_rows.sum()))
 
-    for variant, pca_var, arch_name in VARIANTS_CONFIG:
+        X_train_blocks = [X_orig[train_idx]]
+        y_train_blocks = [y_train_base]
+        aug_tag_blocks: list[list[str]] = [["orig"] * len(train_idx)]
+        for a in use_augs:
+            X_a = concat(wavlm_cache[(layer, a)], whisper_cache[a], feat_arr)
+            X_train_blocks.append(X_a[train_idx])
+            y_train_blocks.append(y_train_base)
+            aug_tag_blocks.append([a] * len(train_idx))
+
+        X_train = np.concatenate(X_train_blocks, axis=0).astype(np.float32)
+        y_train = np.concatenate(y_train_blocks, axis=0).astype(np.int64)
+        aug_tags: list[str] = []
+        for blk in aug_tag_blocks:
+            aug_tags.extend(blk)
+        X_val = X_orig[val_idx]
+        X_test = X_orig[test_idx]
+        log.info("[layer=%s] train=%d (orig=%d + %d augs x %d)  val=%d  test=%d",
+                 layer, len(X_train), len(train_idx), len(use_augs),
+                 len(train_idx), len(X_val), len(X_test))
+
+        scaler = StandardScaler().fit(X_train)
+        X_train_s = scaler.transform(X_train).astype(np.float32)
+        X_val_s = scaler.transform(X_val).astype(np.float32)
+        X_test_s = scaler.transform(X_test).astype(np.float32)
+
+        per_layer[layer] = {
+            "X_train_s": X_train_s, "y_train": y_train,
+            "X_val_s": X_val_s, "X_test_s": X_test_s,
+            "aug_tags": aug_tags,
+        }
+
+    # ---- Iterate variants (20 = 2 archs x 2 wavlm layers x 5 PCAs) ----
+    summary_rows: list[dict] = []
+    variants = make_variants()
+    log.info("Running %d variants: %s", len(variants), [v[0] for v in variants])
+
+    for variant, arch_name, layer, pca_var in variants:
         log.info("=" * 60)
         arch = ARCH_CONFIG[arch_name]
-        log.info("VARIANT: %s  arch=%s  pca=%s", variant, arch_name, pca_var)
+        log.info("VARIANT %s   arch=%s   wavlm_layer=%s   pca=%s   augs=%s",
+                 variant, arch_name, layer, pca_var, use_augs)
+        lp = per_layer[layer]
+        X_train_s = lp["X_train_s"]
+        y_train = lp["y_train"]
+        X_val_s = lp["X_val_s"]
+        X_test_s = lp["X_test_s"]
 
         if pca_var is None:
-            X = X_full_std
-            in_dim = X.shape[1]
-            pca = None
+            Xt, Xv, Xs = X_train_s, X_val_s, X_test_s
+            in_dim = Xt.shape[1]
         else:
             pca = PCA(n_components=pca_var, svd_solver="full", random_state=args.seed)
-            pca.fit(X_full_std[splits["train"]])
-            X = pca.transform(X_full_std).astype(np.float32)
-            in_dim = X.shape[1]
+            pca.fit(X_train_s)
+            Xt = pca.transform(X_train_s).astype(np.float32)
+            Xv = pca.transform(X_val_s).astype(np.float32)
+            Xs = pca.transform(X_test_s).astype(np.float32)
+            in_dim = Xt.shape[1]
             log.info("PCA(%.2f) -> %d components", pca_var, in_dim)
 
-        Xt, Xv, Xs = X[splits["train"]], X[splits["val"]], X[splits["test"]]
-        yt, yv, ys = y_full[splits["train"]], y_full[splits["val"]], y_full[splits["test"]]
+        result, test_p = train_one(
+            Xt, y_train, Xv, y_val, Xs, y_test,
+            in_dim=in_dim, batch_size=args.batch_size, epochs=args.epochs,
+            lr=args.lr, wd=arch["weight_decay"], device=device, log=log, tag=variant,
+            hidden=tuple(arch["hidden"]), dropout=arch["dropout"],
+            class_balance=args.class_balance)
 
-        result, test_p = train_one(Xt, yt, Xv, yv, Xs, ys,
-                                   in_dim=in_dim, batch_size=args.batch_size,
-                                   epochs=args.epochs, lr=args.lr,
-                                   wd=arch["weight_decay"],
-                                   hidden=tuple(arch["hidden"]),
-                                   dropout=arch["dropout"],
-                                   device=device, log=log, tag=variant)
-
-        # Save per-variant
         var_dir = out_dir / variant
         var_dir.mkdir(parents=True, exist_ok=True)
-        pred_df = gt.iloc[splits["test"]].copy()
+        pred_df = gt.iloc[test_idx].copy()
         pred_df["pred_score"] = test_p
         pred_df.to_csv(var_dir / "predictions.csv", index=False)
 
         m = result.test_metrics
-        log.info("[%s] TEST  n=%d  auc=%.3f  ap=%.3f  thr0.5 f1=%.3f  best_f1=%.3f@%.2f",
+        log.info("[%s] TEST n=%d  auc=%.3f  ap=%.3f  thr0.5 f1=%.3f  best_f1=%.3f@%.2f",
                  variant, m["n"], m["auc"], m["ap"], m["thr0.5"]["f1"],
                  m["best_f1"]["f1"], m["best_f1"]["threshold"])
-        if "topk" in m:
-            log.info("[%s] TEST  topk(k=%d, base=%.2f) f1=%.3f p=%.3f r=%.3f",
-                     variant, m["topk"]["k"], m["topk"]["base_rate"],
-                     m["topk"]["f1"], m["topk"]["precision"], m["topk"]["recall"])
+        rap = m.get("recall_at_precision", {})
+        log.info("[%s] recall@p  p50=%.3f  p80=%.3f  p90=%.3f  p95=%.3f", variant,
+                 rap.get("p50", {}).get("recall", float("nan")),
+                 rap.get("p80", {}).get("recall", float("nan")),
+                 rap.get("p90", {}).get("recall", float("nan")),
+                 rap.get("p95", {}).get("recall", float("nan")))
 
-        # Per-batch slice
         if "batch" in pred_df.columns:
-            log.info("[%s] per-batch on test:", variant)
-            m["per_batch"] = per_slice_metrics(ys, test_p,
-                                               pred_df["batch"].to_numpy(),
-                                               "batch", log)
-        # Per-region slice
+            log.info("[%s] per-batch test:", variant)
+            m["per_batch"] = per_slice_metrics(y_test, test_p,
+                                               pred_df["batch"].to_numpy(), "batch", log)
         if "region" in pred_df.columns and pred_df["region"].notna().any():
-            log.info("[%s] per-region on test:", variant)
-            m["per_region"] = per_slice_metrics(ys, test_p,
+            log.info("[%s] per-region test:", variant)
+            m["per_region"] = per_slice_metrics(y_test, test_p,
                                                 pred_df["region"].fillna("UNK").to_numpy(),
                                                 "region", log)
 
         with (var_dir / "metrics.json").open("w") as f:
-            json.dump({"variant": variant,
-                       "arch": arch_name,
+            json.dump({"variant": variant, "arch": arch_name,
+                       "wavlm_layer": layer,
                        "hidden": list(arch["hidden"]),
                        "dropout": arch["dropout"],
                        "weight_decay": arch["weight_decay"],
                        "label_smoothing": LABEL_SMOOTHING,
                        "grad_clip": GRAD_CLIP_NORM,
                        "pca": pca_var,
+                       "augs_used": use_augs,
+                       "train_only_batches": train_only_batches,
+                       "min_duration": args.min_duration,
+                       "class_balance": args.class_balance,
+                       "in_dim": in_dim,
                        "best_val_f1": result.best_val_f1,
                        "best_epoch": result.best_epoch,
-                       "in_dim": in_dim,
                        "test": m}, f, indent=2)
 
-        rap = m.get("recall_at_precision", {})
-        log.info("[%s] recall@precision  p50=%.3f  p80=%.3f  p90=%.3f  p95=%.3f", variant,
-                 rap.get("p50", {}).get("recall", float("nan")),
-                 rap.get("p80", {}).get("recall", float("nan")),
-                 rap.get("p90", {}).get("recall", float("nan")),
-                 rap.get("p95", {}).get("recall", float("nan")))
-
         summary_rows.append({
-            "variant": variant,
-            "arch": arch_name,
+            "variant": variant, "arch": arch_name,
+            "wavlm_layer": layer,
             "hidden": "x".join(str(h) for h in arch["hidden"]),
-            "dropout": arch["dropout"],
-            "wd": arch["weight_decay"],
-            "in_dim": in_dim,
+            "dropout": arch["dropout"], "wd": arch["weight_decay"],
+            "pca": "full" if pca_var is None else f"{int(pca_var*100)}",
+            "n_augs": len(use_augs), "in_dim": in_dim,
             "val_f1": round(result.best_val_f1, 4),
             "test_auc": round(m["auc"], 4),
             "test_ap": round(m["ap"], 4),
@@ -741,7 +854,7 @@ def main() -> int:
     summary.to_csv(summary_path, index=False)
     log.info("=" * 60)
     log.info("SUMMARY:\n%s", summary.to_string(index=False))
-    log.info("Wrote summary to %s", summary_path)
+    log.info("Wrote %s", summary_path)
     return 0
 
 

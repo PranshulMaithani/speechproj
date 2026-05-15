@@ -76,6 +76,12 @@ DEFAULT_REGION_BY_BATCH: dict[str, str] = {
     # audios6 intentionally omitted: it has both IND and PHP; rely on its GT.
 }
 
+# NOTE: ALLSTAR ingestion (folders 2676/2677) has been moved to
+# ec2/allstar_prep.py so transcription + feature extraction run on the T4
+# instead of the company laptop. ALLSTAR is a public corpus -- no PII concern
+# about doing the work on EC2. This script now handles mercer-mettl batches
+# only.
+
 TARGET_SR = 16000
 ACCEPT_EXT = {".wav", ".mp3", ".m4a", ".flac", ".ogg", ".webm"}
 MAX_DURATION_SEC: float | None = 90.0

@@ -1,0 +1,171 @@
+================================================================================
+COMMANDS — end-to-end run order
+================================================================================
+
+Roles in the pipeline:
+
+  (A) Company laptop  — has the mercer-mettl audio + transcripts.
+                         Runs prep on mercer-mettl ONLY. Transcripts never
+                         leave here; only numeric feat_* + npys are uploaded.
+  (B) EC2 T4          — everything else. ALLSTAR is public so it's downloaded,
+                         transcribed, and feature-extracted on EC2 directly.
+
+ALLSTAR data lives at:
+    https://huggingface.co/Pransfrance/speechproj-models/resolve/main/2676.zip
+    https://huggingface.co/Pransfrance/speechproj-models/resolve/main/2677.zip
+ec2/allstar_prep.py fetches these via huggingface_hub.
+
+Placeholders below:
+    <UPLOAD>     = the upload/ folder on EC2 (e.g. /opt/data/upload)
+    <RUNS>       = where you want training outputs (e.g. /opt/runs)
+
+--------------------------------------------------------------------------------
+(A) Company laptop — mercer-mettl prep
+--------------------------------------------------------------------------------
+
+# 1. one-time deps
+pip install -r companylaptop\requirements.txt
+
+# 2. run prep over audios2..audios6. Output:
+#    data\neural_prep_out\upload\     -> uploaded to EC2
+#    data\neural_prep_out\local\      -> cid_mapping + log; NEVER uploaded
+python companylaptop\neural_baseline_prep.py
+
+# 3. PII sanity check on the produced gt.csv -- should print only metadata
+#    columns + feat_*  (no 'transcript', no 'candidate_id_real', etc.)
+python -c "import pandas as pd; print(pd.read_csv(r'data\neural_prep_out\upload\gt.csv').columns.tolist())"
+
+# 4. upload to EC2 (rsync / scp / your tool of choice). Example:
+#    scp -r data\neural_prep_out\upload  ec2-user@<EC2_IP>:/opt/data/upload
+
+--------------------------------------------------------------------------------
+(B) EC2 T4 — install, ALLSTAR prep, embedding extraction, training
+--------------------------------------------------------------------------------
+
+# 1. one-time deps  (Python 3.10+ recommended)
+pip install -r ec2/requirements.txt
+python -m spacy download en_core_web_sm
+huggingface-cli login        # paste your HF token (the zips are on a HF repo)
+
+# 2. ALLSTAR prep on EC2: download zips, segment, transcribe, feat_* extract,
+#    APPEND rows to <UPLOAD>/gt.csv. Takes a while (faster-whisper medium on
+#    each 40-60s segment). All processing here, no laptop involvement.
+python ec2/allstar_prep.py --out_dir <UPLOAD>
+
+# What this writes (all under <UPLOAD>):
+#   audio_npy/AS_NNNNN_<qid>.npy        the segment waveforms
+#   gt.csv                              ALLSTAR rows appended in-place
+#   allstar_transcripts.json            {npy_filename: {text, words, ...}}
+#   allstar_speaker_mapping.json        {raw_speaker_id: AS_NNNNN}
+#   allstar_prep_log.txt
+#   .allstar_raw/2676/, .allstar_raw/2677/   unzipped audio (cached)
+
+# 3. ONE-SHOT embedding extraction across all audios in gt.csv (mercer-mettl
+#    AND ALLSTAR) plus every aug. Slow first pass; subsequent runs only
+#    extract whatever's missing.
+python ec2/extract_embeddings.py \
+    --data_dir <UPLOAD> \
+    --out_path <UPLOAD>/embeddings_cache.npz \
+    --augs orig,noise,pitch,speed,gain,air,vtlp,combo \
+    --wavlm_layers last,9
+
+# 4. TRAINING ITERATIONS. 20 variants per call (2 archs x 2 wavlm layers x
+#    5 PCA settings). Cache is reused, so each call is fast.
+
+# 4a. Mode A baseline — 60/20/20 candidate-wise on mercer-mettl + ALLSTAR
+#     forced into train only. Sampler-balanced minibatches by default.
+python ec2/neural_baseline_train.py \
+    --data_dir <UPLOAD> \
+    --out_dir  <RUNS>/modeA_base \
+    --train_batches audios2,audios4,audios5,audios6,2676,2677 \
+    --train_only_batches 2676,2677
+
+# 4b. Mode B IND-only diagnostic — test on audios6 IND rows only, with a
+#     5s min-duration floor.
+python ec2/neural_baseline_train.py \
+    --data_dir <UPLOAD> \
+    --out_dir  <RUNS>/modeB_IND \
+    --train_batches audios2,audios4,audios5,2676,2677 \
+    --train_only_batches 2676,2677 \
+    --test_batches  audios6 \
+    --test_region_filter IND \
+    --min_duration 5.0
+
+# 4c. Mode B + augmentation expansion of the training set.
+python ec2/neural_baseline_train.py \
+    --data_dir <UPLOAD> \
+    --out_dir  <RUNS>/modeB_IND_aug \
+    --train_batches audios2,audios4,audios5,2676,2677 \
+    --train_only_batches 2676,2677 \
+    --test_batches  audios6 \
+    --test_region_filter IND \
+    --min_duration 5.0 \
+    --use_augs all
+
+# 4d. Same Mode B but WITHOUT ALLSTAR — to isolate whether ALLSTAR helps.
+python ec2/neural_baseline_train.py \
+    --data_dir <UPLOAD> \
+    --out_dir  <RUNS>/modeB_IND_no_allstar \
+    --train_batches audios2,audios4,audios5 \
+    --train_only_batches "" \
+    --test_batches  audios6 \
+    --test_region_filter IND \
+    --min_duration 5.0
+
+# 4e. Ablation — old-style class balancing (pos_weight, no sampler).
+python ec2/neural_baseline_train.py \
+    --data_dir <UPLOAD> \
+    --out_dir  <RUNS>/modeB_IND_posweight \
+    --train_batches audios2,audios4,audios5,2676,2677 \
+    --train_only_batches 2676,2677 \
+    --test_batches  audios6 \
+    --test_region_filter IND \
+    --min_duration 5.0 \
+    --class_balance pos_weight
+
+# 5. Compare runs. Each <RUNS>/<name>/summary.csv has 20 rows (one per
+#    variant). Pull the top-5 by test_best_f1 from each:
+python - <<'PY'
+import glob, os, pandas as pd
+for f in sorted(glob.glob('<RUNS>/*/summary.csv')):
+    run = os.path.basename(os.path.dirname(f))
+    df = pd.read_csv(f).sort_values('test_best_f1', ascending=False)
+    print(f'\n=== {run}  top-5 by test_best_f1 ===')
+    print(df.head(5).to_string(index=False))
+PY
+
+
+================================================================================
+NOTES
+================================================================================
+
+* (A) is one-time per dataset refresh of mercer-mettl. (B.2) and (B.3) are
+  one-time per dataset state. (B.4) is what you iterate on.
+
+* Speaker leakage is prevented in two layers:
+    - mercer-mettl candidates live in the G_NNNNN namespace,
+      ALLSTAR speakers in AS_NNNNN.
+    - StratifiedGroupKFold partitions by group_id; assert_no_group_leak()
+      verifies disjointness.
+  --train_only_batches additionally forces ALLSTAR rows into train (never
+  val/test).
+
+* Class balance defaults to --class_balance sampler (WeightedRandomSampler:
+  every train minibatch is class-balanced in expectation). Val/test always
+  use the natural distribution.
+
+* feat_* columns (the full 55-feature audios6_eval set: disfluency +
+  stylometric + pause + suspicious + formal_AI + prosodic + voice_quality +
+  perplexity) are concatenated with WavLM + Whisper BEFORE standardization
+  and PCA. Every PCA variant -- full / pca98 / pca95 / pca93 / pca90 --
+  trains on a compressed representation that still contains the text
+  features. ALLSTAR rows have the same feat_* columns, computed from
+  faster-whisper transcriptions on EC2.
+
+* extract_embeddings.py is INCREMENTAL. If you add audios to gt.csv later
+  (e.g. re-run allstar_prep.py with new tasks), just re-run extract -- only
+  the new (filename, aug, layer) combinations are recomputed.
+
+* allstar_prep.py periodically flushes gt.csv every 100 segments so a
+  mid-run crash does not lose work. Re-running picks up where it left off
+  based on existing rows in gt.csv.
