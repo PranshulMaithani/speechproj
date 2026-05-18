@@ -1,0 +1,364 @@
+"""Shared data-pipeline helpers used by both neural_baseline_train.py and
+xgboost_train.py.
+
+The point of this module is that both training scripts MUST see the same
+filtered gt.csv, the same train/val/test row indices, and the same
+WavLM/Whisper/feat_* arrays for a given run. Otherwise summary1.csv (NN)
+and summary2.csv (XGB) are not comparable on the same data.
+
+What lives here:
+  - WAVLM_LAYERS              : layers required from the cache (last, 9)
+  - setup_logging             : tee log to file + stdout
+  - _kfold_indices            : StratifiedGroupKFold helper
+  - build_splits              : Mode A / Mode B split builder
+  - assert_no_group_leak      : assert train/val/test groups disjoint
+  - load_cache_reindexed      : align cache rows to gt order
+  - resolve_use_augs          : parse --use_augs against cache
+  - compute_metrics           : F1/AP/AUC + recall@precision
+  - per_slice_metrics         : same metrics over a slice column
+  - load_gt_and_filter        : read gt.csv, drop bad labels, apply
+                                --min_duration, return reset DataFrame
+  - assemble_features         : per-WavLM-layer (X_train_aug, X_val, X_test,
+                                aug_tags) builder, used by both heads
+"""
+
+from __future__ import annotations
+
+import logging
+import sys
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+from sklearn.metrics import (average_precision_score, f1_score,
+                             precision_recall_curve,
+                             precision_recall_fscore_support, roc_auc_score)
+from sklearn.model_selection import StratifiedGroupKFold
+
+
+# WavLM layers expected in the cache and used by every variant
+# (extract_embeddings.py must have been run with --wavlm_layers last,9).
+WAVLM_LAYERS: list[str] = ["last", "9"]
+
+
+# ----------------------------------------------------------------------------
+# Logging.
+# ----------------------------------------------------------------------------
+
+def setup_logging(log_path: Path, name: str = "train") -> logging.Logger:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    logger = logging.getLogger(name)
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear()
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%H:%M:%S")
+    fh = logging.FileHandler(log_path, mode="w", encoding="utf-8")
+    fh.setFormatter(fmt)
+    sh = logging.StreamHandler(sys.stdout)
+    sh.setFormatter(fmt)
+    logger.addHandler(fh)
+    logger.addHandler(sh)
+    return logger
+
+
+# ----------------------------------------------------------------------------
+# Splits.
+# ----------------------------------------------------------------------------
+
+def _kfold_indices(y: np.ndarray, g: np.ndarray, n_splits: int, seed: int) -> list[np.ndarray]:
+    skf = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=seed)
+    return [te for _, te in skf.split(np.zeros(len(y)), y, g)]
+
+
+def build_splits(gt: pd.DataFrame, train_batches: list[str],
+                 test_batches: list[str] | None,
+                 test_region_filter: str | None,
+                 train_only_batches: list[str],
+                 seed: int, log: logging.Logger) -> dict[str, np.ndarray]:
+    """train_only_batches: batches whose rows are forced into the train split
+    only -- never appear in val/test. Their group_ids are also stripped from
+    the candidate-leak check (they're already disjoint by construction)."""
+    train_only_set = set(train_only_batches or [])
+    train_only_mask = gt["batch"].isin(train_only_set).to_numpy() if train_only_set else np.zeros(len(gt), dtype=bool)
+    train_only_idx = np.where(train_only_mask)[0]
+    if len(train_only_idx):
+        log.info("train_only rows (auxiliary, forced to train): %d (batches=%s)",
+                 len(train_only_idx), sorted(train_only_set))
+
+    train_pool_batches = [b for b in train_batches if b not in train_only_set]
+    pool_mask = gt["batch"].isin(train_pool_batches).to_numpy()
+
+    if not test_batches:
+        sub = gt[pool_mask].reset_index().rename(columns={"index": "_orig"})
+        if len(sub) == 0:
+            raise ValueError(f"No rows match train_batches={train_pool_batches} "
+                             f"(after excluding train_only={sorted(train_only_set)})")
+        folds = _kfold_indices(sub["label"].to_numpy(), sub["group_id"].to_numpy(),
+                               n_splits=5, seed=seed)
+        test_local = folds[0]
+        val_local = folds[1]
+        used = set(test_local) | set(val_local)
+        train_local = np.array([i for i in range(len(sub)) if i not in used])
+        to_orig = sub["_orig"].to_numpy()
+        train_idx = np.concatenate([to_orig[train_local], train_only_idx])
+        log.info("Split mode A: 60/20/20 candidate-wise on %s  + %d train_only rows",
+                 train_pool_batches, len(train_only_idx))
+        return {"train": train_idx,
+                "val":   to_orig[val_local],
+                "test":  to_orig[test_local]}
+
+    test_mask = gt["batch"].isin(test_batches).to_numpy()
+    if test_region_filter:
+        if "region" not in gt.columns:
+            raise ValueError("region filter requested but gt has no 'region' column")
+        test_mask &= (gt["region"].astype(str) == test_region_filter).to_numpy()
+
+    test_idx = np.where(test_mask)[0]
+    if len(test_idx) == 0:
+        raise ValueError(f"No test rows match batches={test_batches} region={test_region_filter}")
+
+    test_groups = set(gt.iloc[test_idx]["group_id"].tolist())
+    eligible_mask = pool_mask & ~gt["group_id"].isin(test_groups).to_numpy() & ~test_mask
+    sub = gt[eligible_mask].reset_index().rename(columns={"index": "_orig"})
+    if len(sub) == 0:
+        raise ValueError(f"No train-pool rows after excluding test groups; "
+                         f"train_pool_batches={train_pool_batches}")
+
+    val_local: np.ndarray | None = None
+    if test_region_filter and "region" in gt.columns:
+        same_region_mask = (sub["region"].astype(str) == test_region_filter).to_numpy()
+        if same_region_mask.sum() >= 30 and len(np.unique(sub.loc[same_region_mask, "label"])) == 2:
+            sub_r = sub[same_region_mask].reset_index(drop=True)
+            r_folds = _kfold_indices(sub_r["label"].to_numpy(),
+                                     sub_r["group_id"].to_numpy(), n_splits=5, seed=seed)
+            sub_r_to_sub = np.where(same_region_mask)[0]
+            val_local = sub_r_to_sub[r_folds[0]]
+            log.info("Mode B val: drawn from region=%s subset of train pool (n=%d)",
+                     test_region_filter, len(val_local))
+        else:
+            log.warning("Mode B: region=%s subset too small or single-class -- using mixed val",
+                        test_region_filter)
+
+    if val_local is None:
+        folds = _kfold_indices(sub["label"].to_numpy(), sub["group_id"].to_numpy(),
+                               n_splits=5, seed=seed)
+        val_local = folds[0]
+
+    train_local = np.array([i for i in range(len(sub)) if i not in set(val_local)])
+    to_orig = sub["_orig"].to_numpy()
+    train_idx = np.concatenate([to_orig[train_local], train_only_idx])
+    log.info("Split mode B: train=%s test=%s region_filter=%s  + %d train_only rows",
+             train_pool_batches, test_batches, test_region_filter, len(train_only_idx))
+    return {"train": train_idx,
+            "val":   to_orig[val_local],
+            "test":  test_idx}
+
+
+def assert_no_group_leak(gt: pd.DataFrame, splits: dict[str, np.ndarray]) -> None:
+    sets = {k: set(gt.iloc[idx]["group_id"]) for k, idx in splits.items()}
+    assert sets["train"].isdisjoint(sets["test"]), "train/test group leak"
+    assert sets["train"].isdisjoint(sets["val"]),  "train/val group leak"
+    assert sets["val"].isdisjoint(sets["test"]),   "val/test group leak"
+
+
+# ----------------------------------------------------------------------------
+# gt loading + min_duration filter.
+# ----------------------------------------------------------------------------
+
+def load_gt_and_filter(data_dir: Path, min_duration: float, log: logging.Logger
+                       ) -> pd.DataFrame:
+    gt = pd.read_csv(data_dir / "gt.csv")
+    log.info("Loaded gt.csv: %d rows", len(gt))
+
+    gt["label"] = pd.to_numeric(gt["label"], errors="coerce")
+    n_before = len(gt)
+    gt = gt[gt["label"].isin([0, 1])].copy()
+    gt["label"] = gt["label"].astype(int)
+    gt = gt.reset_index(drop=True)
+    log.info("Filtered to {0,1} labels: %d -> %d", n_before, len(gt))
+
+    if min_duration > 0.0:
+        if "duration_sec" not in gt.columns:
+            log.warning("--min_duration set but gt has no duration_sec column; skipping filter")
+        else:
+            n_before = len(gt)
+            gt = gt[pd.to_numeric(gt["duration_sec"], errors="coerce")
+                      .fillna(0.0) >= min_duration].reset_index(drop=True)
+            log.info("min_duration=%.2fs filter: %d -> %d rows",
+                     min_duration, n_before, len(gt))
+    return gt
+
+
+# ----------------------------------------------------------------------------
+# Cache helpers.
+# ----------------------------------------------------------------------------
+
+def load_cache_reindexed(cache_path: Path, filenames_cur: np.ndarray,
+                         aug_names_needed: list[str], layers_needed: list[str],
+                         log: logging.Logger
+                         ) -> tuple[dict[tuple[str, str], np.ndarray],
+                                    dict[str, np.ndarray]]:
+    """Returns (wavlm_by_layer_aug, whisper_by_aug), both aligned to filenames_cur.
+
+    Old caches (no 'wavlm_layers' key) are read as if they held only 'last'.
+    """
+    if not cache_path.exists():
+        raise FileNotFoundError(
+            f"No embedding cache at {cache_path}. Run extract_embeddings.py first.")
+    cache = dict(np.load(cache_path, allow_pickle=True))
+    cached_filenames = cache["filenames"].astype(str)
+    cached_augs = list(cache["aug_names"].astype(str))
+    if "wavlm_layers" in cache:
+        cached_layers = list(cache["wavlm_layers"].astype(str))
+    else:
+        cached_layers = ["last"]
+        for a in cached_augs:
+            if f"wavlm_{a}" in cache and f"wavlm_last_{a}" not in cache:
+                cache[f"wavlm_last_{a}"] = cache[f"wavlm_{a}"]
+    log.info("cache: %d filenames, augs=%s, layers=%s",
+             len(cached_filenames), cached_augs, cached_layers)
+
+    missing_augs = [a for a in aug_names_needed if a not in cached_augs]
+    if missing_augs:
+        raise ValueError(
+            f"Augs requested but not in cache: {missing_augs}. "
+            f"Cache has: {cached_augs}. Re-run extract_embeddings.py.")
+    missing_layers = [l for l in layers_needed if l not in cached_layers]
+    if missing_layers:
+        raise ValueError(
+            f"WavLM layers requested but not in cache: {missing_layers}. "
+            f"Cache has: {cached_layers}. Re-run extract_embeddings.py with "
+            f"--wavlm_layers including those.")
+
+    f2c = {f: i for i, f in enumerate(cached_filenames)}
+    missing_files = [f for f in filenames_cur if f not in f2c]
+    if missing_files:
+        raise ValueError(
+            f"{len(missing_files)} gt rows have npy_filename not in the cache. "
+            f"First few: {missing_files[:5]}. Re-run extract_embeddings.py.")
+
+    order = np.array([f2c[f] for f in filenames_cur])
+    wavlm_out: dict[tuple[str, str], np.ndarray] = {}
+    whisper_out: dict[str, np.ndarray] = {}
+    for layer in layers_needed:
+        for a in aug_names_needed:
+            wavlm_out[(layer, a)] = cache[f"wavlm_{layer}_{a}"][order]
+    for a in aug_names_needed:
+        whisper_out[a] = cache[f"whisper_{a}"][order]
+    return wavlm_out, whisper_out
+
+
+def resolve_use_augs(use_augs_arg: str, cache_path: Path,
+                     log: logging.Logger) -> list[str]:
+    """Parse --use_augs into a list of aug names that exist in the cache.
+    'all' = every aug in the cache except 'orig'. Empty -> []."""
+    s = use_augs_arg.strip()
+    if not s:
+        return []
+    cache = dict(np.load(cache_path, allow_pickle=True))
+    cached_augs = [a for a in cache["aug_names"].astype(str) if a != "orig"]
+    if s.lower() == "all":
+        log.info("--use_augs=all -> using every non-orig aug in cache: %s", cached_augs)
+        return cached_augs
+    wanted = [a.strip() for a in s.split(",") if a.strip() and a.strip() != "orig"]
+    missing = [a for a in wanted if a not in cached_augs]
+    if missing:
+        raise ValueError(f"--use_augs requested {missing} but cache has {cached_augs}. "
+                         f"Re-run extract_embeddings.py.")
+    return wanted
+
+
+# ----------------------------------------------------------------------------
+# Metrics.
+# ----------------------------------------------------------------------------
+
+def compute_metrics(y_true: np.ndarray, p: np.ndarray) -> dict:
+    out: dict = {}
+    out["n"] = int(len(y_true))
+    out["n_pos"] = int((y_true == 1).sum())
+    out["n_neg"] = int((y_true == 0).sum())
+
+    yhat = (p >= 0.5).astype(int)
+    pr, rc, f1, _ = precision_recall_fscore_support(y_true, yhat, average="binary", zero_division=0)
+    out["thr0.5"] = {"precision": float(pr), "recall": float(rc), "f1": float(f1)}
+
+    thrs = np.linspace(0.05, 0.95, 91)
+    f1s = [f1_score(y_true, (p >= t).astype(int), zero_division=0) for t in thrs]
+    best_t = float(thrs[int(np.argmax(f1s))])
+    yhat = (p >= best_t).astype(int)
+    pr, rc, f1, _ = precision_recall_fscore_support(y_true, yhat, average="binary", zero_division=0)
+    out["best_f1"] = {"threshold": best_t, "precision": float(pr),
+                     "recall": float(rc), "f1": float(f1)}
+
+    base_rate = float(np.mean(y_true == 1))
+    if base_rate > 0:
+        k = max(1, int(round(base_rate * len(y_true))))
+        order = np.argsort(-p)
+        yhat = np.zeros_like(y_true)
+        yhat[order[:k]] = 1
+        pr, rc, f1, _ = precision_recall_fscore_support(y_true, yhat, average="binary", zero_division=0)
+        out["topk"] = {"k": k, "base_rate": base_rate, "precision": float(pr),
+                       "recall": float(rc), "f1": float(f1)}
+
+    try:
+        out["auc"] = float(roc_auc_score(y_true, p))
+        out["ap"] = float(average_precision_score(y_true, p))
+    except ValueError:
+        out["auc"] = float("nan")
+        out["ap"] = float("nan")
+
+    rap: dict[str, dict] = {}
+    try:
+        prec, rec, thr = precision_recall_curve(y_true, p)
+        prec_t = prec[:-1]
+        rec_t = rec[:-1]
+        for target in (0.50, 0.80, 0.90, 0.95):
+            mask = prec_t >= target
+            if mask.any():
+                idx = int(np.argmax(np.where(mask, rec_t, -1.0)))
+                rap[f"p{int(target * 100)}"] = {
+                    "target_precision": float(target),
+                    "achieved_precision": float(prec_t[idx]),
+                    "recall": float(rec_t[idx]),
+                    "threshold": float(thr[idx]),
+                }
+            else:
+                rap[f"p{int(target * 100)}"] = {
+                    "target_precision": float(target),
+                    "achieved_precision": float("nan"),
+                    "recall": 0.0,
+                    "threshold": float("nan"),
+                }
+    except ValueError:
+        for target in (0.50, 0.80, 0.90, 0.95):
+            rap[f"p{int(target * 100)}"] = {
+                "target_precision": float(target),
+                "achieved_precision": float("nan"),
+                "recall": float("nan"),
+                "threshold": float("nan"),
+            }
+    out["recall_at_precision"] = rap
+    return out
+
+
+def per_slice_metrics(y_true: np.ndarray, p: np.ndarray, slice_vals: np.ndarray,
+                      slice_name: str, log: logging.Logger) -> dict:
+    res = {}
+    for v in pd.Series(slice_vals).dropna().unique():
+        m = slice_vals == v
+        if m.sum() < 5 or len(np.unique(y_true[m])) < 2:
+            continue
+        res[str(v)] = compute_metrics(y_true[m], p[m])
+        log.info("  [%s=%s] n=%d  auc=%.3f  best_f1=%.3f@%.2f  thr0.5_f1=%.3f",
+                 slice_name, v, int(m.sum()), res[str(v)]["auc"],
+                 res[str(v)]["best_f1"]["f1"], res[str(v)]["best_f1"]["threshold"],
+                 res[str(v)]["thr0.5"]["f1"])
+    return res
+
+
+def sweep_threshold(y_val: np.ndarray, p_val: np.ndarray,
+                    lo: float = 0.05, hi: float = 0.95, n: int = 91) -> tuple[float, float]:
+    """Pick the threshold that maximizes F1 on (y_val, p_val)."""
+    thrs = np.linspace(lo, hi, n)
+    f1s = [f1_score(y_val, (p_val >= t).astype(int), zero_division=0) for t in thrs]
+    i = int(np.argmax(f1s))
+    return float(thrs[i]), float(f1s[i])

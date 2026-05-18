@@ -69,20 +69,38 @@ python ec2/extract_embeddings.py \
     --augs orig,noise,pitch,speed,gain,air,vtlp,combo \
     --wavlm_layers last,9
 
-# 4. TRAINING ITERATIONS. 20 variants per call (2 archs x 2 wavlm layers x
-#    5 PCA settings). Cache is reused, so each call is fast.
+# 4. TRAINING ITERATIONS. Each recipe runs TWO heads on the same splits:
+#       neural_baseline_train.py  -> summary1.csv (20 NN variants)
+#       xgboost_train.py          -> summary2.csv (tier-A/B XGB bases + picks)
+#    The XGB script reuses the same gt filter + train/val/test indices (via
+#    ec2/_data_pipeline.py), so summary1 and summary2 are comparable
+#    apples-to-apples on the SAME data. Run them with the same flags and
+#    --out_dir; both write into that folder.
 
-# 4a. Mode A baseline — 60/20/20 candidate-wise on mercer-mettl + ALLSTAR
+# 4a. Mode A baseline -- 60/20/20 candidate-wise on mercer-mettl + ALLSTAR
 #     forced into train only. Sampler-balanced minibatches by default.
 python ec2/neural_baseline_train.py \
     --data_dir <UPLOAD> \
     --out_dir  <RUNS>/modeA_base \
     --train_batches audios2,audios4,audios5,audios6,2676,2677 \
     --train_only_batches 2676,2677
+python ec2/xgboost_train.py \
+    --data_dir <UPLOAD> \
+    --out_dir  <RUNS>/modeA_base \
+    --train_batches audios2,audios4,audios5,audios6,2676,2677 \
+    --train_only_batches 2676,2677
 
-# 4b. Mode B IND-only diagnostic — test on audios6 IND rows only, with a
+# 4b. Mode B IND-only diagnostic -- test on audios6 IND rows only, with a
 #     5s min-duration floor.
 python ec2/neural_baseline_train.py \
+    --data_dir <UPLOAD> \
+    --out_dir  <RUNS>/modeB_IND \
+    --train_batches audios2,audios4,audios5,2676,2677 \
+    --train_only_batches 2676,2677 \
+    --test_batches  audios6 \
+    --test_region_filter IND \
+    --min_duration 5.0
+python ec2/xgboost_train.py \
     --data_dir <UPLOAD> \
     --out_dir  <RUNS>/modeB_IND \
     --train_batches audios2,audios4,audios5,2676,2677 \
@@ -101,8 +119,17 @@ python ec2/neural_baseline_train.py \
     --test_region_filter IND \
     --min_duration 5.0 \
     --use_augs all
+python ec2/xgboost_train.py \
+    --data_dir <UPLOAD> \
+    --out_dir  <RUNS>/modeB_IND_aug \
+    --train_batches audios2,audios4,audios5,2676,2677 \
+    --train_only_batches 2676,2677 \
+    --test_batches  audios6 \
+    --test_region_filter IND \
+    --min_duration 5.0 \
+    --use_augs all
 
-# 4d. Same Mode B but WITHOUT ALLSTAR — to isolate whether ALLSTAR helps.
+# 4d. Same Mode B but WITHOUT ALLSTAR -- to isolate whether ALLSTAR helps.
 python ec2/neural_baseline_train.py \
     --data_dir <UPLOAD> \
     --out_dir  <RUNS>/modeB_IND_no_allstar \
@@ -111,8 +138,16 @@ python ec2/neural_baseline_train.py \
     --test_batches  audios6 \
     --test_region_filter IND \
     --min_duration 5.0
+python ec2/xgboost_train.py \
+    --data_dir <UPLOAD> \
+    --out_dir  <RUNS>/modeB_IND_no_allstar \
+    --train_batches audios2,audios4,audios5 \
+    --train_only_batches "" \
+    --test_batches  audios6 \
+    --test_region_filter IND \
+    --min_duration 5.0
 
-# 4e. Ablation — old-style class balancing (pos_weight, no sampler).
+# 4e. Ablation -- old-style class balancing (pos_weight) on both heads.
 python ec2/neural_baseline_train.py \
     --data_dir <UPLOAD> \
     --out_dir  <RUNS>/modeB_IND_posweight \
@@ -122,16 +157,33 @@ python ec2/neural_baseline_train.py \
     --test_region_filter IND \
     --min_duration 5.0 \
     --class_balance pos_weight
+python ec2/xgboost_train.py \
+    --data_dir <UPLOAD> \
+    --out_dir  <RUNS>/modeB_IND_posweight \
+    --train_batches audios2,audios4,audios5,2676,2677 \
+    --train_only_batches 2676,2677 \
+    --test_batches  audios6 \
+    --test_region_filter IND \
+    --min_duration 5.0 \
+    --class_balance pos_weight
 
-# 5. Compare runs. Each <RUNS>/<name>/summary.csv has 20 rows (one per
-#    variant). Pull the top-5 by test_best_f1 from each:
+# 5. Compare runs. summary1.csv = NN variants (20 rows), summary2.csv = XGB
+#    variants (tier-A bases + tier-B prosodic-base + tier-A/B picks). Each
+#    recipe's <RUNS>/<name>/ has both. Pull the top-5 by test_best_f1 from
+#    each head, side-by-side.
 python - <<'PY'
 import glob, os, pandas as pd
-for f in sorted(glob.glob('<RUNS>/*/summary.csv')):
-    run = os.path.basename(os.path.dirname(f))
-    df = pd.read_csv(f).sort_values('test_best_f1', ascending=False)
-    print(f'\n=== {run}  top-5 by test_best_f1 ===')
-    print(df.head(5).to_string(index=False))
+for d in sorted({os.path.dirname(f) for f in glob.glob('<RUNS>/*/summary*.csv')}):
+    run = os.path.basename(d)
+    print(f'\n========== {run} ==========')
+    for which, fname in [('NN (summary1)', 'summary1.csv'),
+                         ('XGB (summary2)', 'summary2.csv')]:
+        p = os.path.join(d, fname)
+        if not os.path.exists(p):
+            print(f'  -- {which}: not run yet'); continue
+        df = pd.read_csv(p).sort_values('test_best_f1', ascending=False)
+        print(f'  -- {which}  top-5 by test_best_f1 --')
+        print(df.head(5).to_string(index=False))
 PY
 
 
@@ -169,3 +221,24 @@ NOTES
 * allstar_prep.py periodically flushes gt.csv every 100 segments so a
   mid-run crash does not lose work. Re-running picks up where it left off
   based on existing rows in gt.csv.
+
+* NN and XGB share splits via ec2/_data_pipeline.py. Running both scripts
+  with the SAME --data_dir / --train_batches / --test_batches / --seed /
+  --min_duration / --train_only_batches yields identical train, val, and
+  test row indices -- summary1.csv (NN) and summary2.csv (XGB) are
+  comparable apples-to-apples on the same data. They both also write a
+  per-variant subdir with predictions.csv + metrics.json (prefixed `xgb_`
+  for XGB variants), so you can stack predictions across heads.
+
+* XGB variants in summary2.csv:
+    Tier A bases:
+      text_all_xgb, text_stylo_xgb, text_top20_xgb, whisper_xgb,
+      wavlm_xgb_{last,l9}, everything_xgb_{last,l9}
+    Tier B base:
+      text_prosodic_base_xgb (content-invariant subset)
+    Tier A picks (weighted-average of base probabilities, threshold tuned
+    on val):
+      tierA_pick1_{last,l9}, tierA_pick2_{last,l9}, tierA_pick3
+    Tier B pick:
+      tierB_prosodic_fusion_{last,l9}
+  Variants without WavLM have wavlm_layer='n/a' and run once.
