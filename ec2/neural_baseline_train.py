@@ -85,9 +85,10 @@ from sklearn.preprocessing import StandardScaler
 from torch.utils.data import DataLoader, TensorDataset
 
 from _data_pipeline import (WAVLM_LAYERS, assert_no_group_leak, build_splits,
-                            compute_metrics, load_cache_reindexed,
-                            load_gt_and_filter, per_slice_metrics,
-                            resolve_use_augs, setup_logging)
+                            compute_metrics, extract_region_metrics,
+                            load_cache_reindexed, load_gt_and_filter,
+                            log_split_breakdown, log_variant_prelude,
+                            per_slice_metrics, resolve_use_augs, setup_logging)
 
 # ----------------------------------------------------------------------------
 # Variants.
@@ -290,6 +291,11 @@ def main() -> int:
                     help="comma-separated aug names from the cache to add to TRAIN "
                          "(val/test always use 'orig'). 'all' = every aug in cache. "
                          "Empty (default) = no augs.")
+    ap.add_argument("--use_text_features", default="true",
+                    choices=["true", "false"],
+                    help="Include feat_* handcrafted features in the input "
+                         "vector. When false, the MLP is trained on WavLM + "
+                         "Whisper only.")
     ap.add_argument("--batch_size", type=int, default=64)
     ap.add_argument("--epochs", type=int, default=60)
     ap.add_argument("--lr", type=float, default=1e-3)
@@ -303,6 +309,7 @@ def main() -> int:
                          "'none' = natural distribution, no correction.")
     args = ap.parse_args()
 
+    use_text_features = (args.use_text_features == "true")
     train_batches = [b.strip() for b in args.train_batches.split(",") if b.strip()]
     test_batches = [b.strip() for b in args.test_batches.split(",") if b.strip()]
     train_only_batches = [b.strip() for b in args.train_only_batches.split(",") if b.strip()]
@@ -317,6 +324,7 @@ def main() -> int:
     log.info("data_dir = %s", data_dir)
     log.info("out_dir  = %s", out_dir)
     log.info("cache    = %s", cache_path)
+    log.info("use_text_features = %s", use_text_features)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     log.info("device   = %s", device)
 
@@ -353,14 +361,18 @@ def main() -> int:
 
     # ---- Handcrafted features
     feat_cols = [c for c in gt.columns if c.startswith("feat_")]
-    if feat_cols:
+    if feat_cols and use_text_features:
         feat_block = gt[feat_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0)
         feat_arr = feat_block.to_numpy().astype(np.float32)
         log.info("handcrafted feats: %d cols  first10=%s%s",
                  len(feat_cols), feat_cols[:10], " ..." if len(feat_cols) > 10 else "")
     else:
         feat_arr = None
-        log.info("no feat_* columns -- audio embeddings only")
+        if not use_text_features:
+            log.info("--use_text_features=false  -> feat_* dropped; "
+                     "training on WavLM + Whisper only")
+        else:
+            log.info("no feat_* columns -- audio embeddings only")
 
     def concat(wavlm: np.ndarray, whisper: np.ndarray, feats: np.ndarray | None) -> np.ndarray:
         parts = [wavlm, whisper]
@@ -377,18 +389,7 @@ def main() -> int:
                           train_only_batches=train_only_batches,
                           seed=args.seed, log=log)
     assert_no_group_leak(gt, splits)
-    for k, idx in splits.items():
-        labels = y_full[idx]
-        n_pos = int((labels == 1).sum())
-        n_neg = int((labels == 0).sum())
-        n_tot = max(len(idx), 1)
-        log.info("split %-5s n=%4d  pos=%4d (%.1f%%)  neg=%4d (%.1f%%)  groups=%4d",
-                 k, len(idx), n_pos, 100 * n_pos / n_tot,
-                 n_neg, 100 * n_neg / n_tot,
-                 gt.iloc[idx]["group_id"].nunique())
-        if "batch" in gt.columns:
-            log.info("split %-5s batches: %s", k,
-                     gt.iloc[idx]["batch"].value_counts().to_dict())
+    log_split_breakdown(gt, splits, log)
     log.info("--class_balance=%s will be applied to TRAIN minibatches "
              "(val/test always use natural distribution)", args.class_balance)
 
@@ -452,6 +453,7 @@ def main() -> int:
         arch = ARCH_CONFIG[arch_name]
         log.info("VARIANT %s   arch=%s   wavlm_layer=%s   pca=%s   augs=%s",
                  variant, arch_name, layer, pca_var, use_augs)
+        log_variant_prelude(variant, gt, splits, log)
         lp = per_layer[layer]
         X_train_s = lp["X_train_s"]
         y_train = lp["y_train"]
@@ -522,6 +524,8 @@ def main() -> int:
                        "best_epoch": result.best_epoch,
                        "test": m}, f, indent=2)
 
+        ind = extract_region_metrics(m, "IND")
+        php = extract_region_metrics(m, "PHP")
         summary_rows.append({
             "variant": variant, "arch": arch_name,
             "wavlm_layer": layer,
@@ -538,10 +542,22 @@ def main() -> int:
             "test_topk_f1": round(m.get("topk", {}).get("f1", float("nan")), 4),
             "recall@p50": round(rap.get("p50", {}).get("recall", float("nan")), 4),
             "recall@p80": round(rap.get("p80", {}).get("recall", float("nan")), 4),
+            "recall@p85": round(rap.get("p85", {}).get("recall", float("nan")), 4),
             "recall@p90": round(rap.get("p90", {}).get("recall", float("nan")), 4),
             "recall@p95": round(rap.get("p95", {}).get("recall", float("nan")), 4),
             "thr@p80": round(rap.get("p80", {}).get("threshold", float("nan")), 3),
             "thr@p90": round(rap.get("p90", {}).get("threshold", float("nan")), 3),
+            # per-region columns (NaN when the region is absent from test)
+            "ind_f1":    round(ind["f1"], 4),
+            "ind_r@p80": round(ind["p80"], 4),
+            "ind_r@p85": round(ind["p85"], 4),
+            "ind_r@p90": round(ind["p90"], 4),
+            "ind_r@p95": round(ind["p95"], 4),
+            "php_f1":    round(php["f1"], 4),
+            "php_r@p80": round(php["p80"], 4),
+            "php_r@p85": round(php["p85"], 4),
+            "php_r@p90": round(php["p90"], 4),
+            "php_r@p95": round(php["p95"], 4),
         })
 
     summary = pd.DataFrame(summary_rows)

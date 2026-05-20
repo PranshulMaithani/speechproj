@@ -230,15 +230,31 @@ NOTES
   per-variant subdir with predictions.csv + metrics.json (prefixed `xgb_`
   for XGB variants), so you can stack predictions across heads.
 
-* XGB variants in summary2.csv:
-    Tier A bases:
+* XGB variants in summary2.csv (Tier A only -- Tier B was dropped after
+  consistently underperforming Tier A in prior runs):
+    Bases:
       text_all_xgb, text_stylo_xgb, text_top20_xgb, whisper_xgb,
       wavlm_xgb_{last,l9}, everything_xgb_{last,l9}
-    Tier B base:
-      text_prosodic_base_xgb (content-invariant subset)
-    Tier A picks (weighted-average of base probabilities, threshold tuned
-    on val):
+    Picks (weighted-average of base probabilities, threshold tuned on val):
       tierA_pick1_{last,l9}, tierA_pick2_{last,l9}, tierA_pick3
-    Tier B pick:
-      tierB_prosodic_fusion_{last,l9}
   Variants without WavLM have wavlm_layer='n/a' and run once.
+
+* --use_text_features (default true) toggles whether handcrafted feat_*
+  columns are part of the input. Both heads accept the flag.
+    NN  : false -> input vector is WavLM+Whisper only; all 20 variants run.
+    XGB : false -> text-only bases (text_all/text_stylo/text_top20) are
+                   skipped, 'everything' becomes wavlm+whisper, and picks
+                   drop their text members (renormalized over the rest;
+                   picks with <2 surviving members are skipped).
+
+* New summary columns in BOTH summary1.csv and summary2.csv:
+    recall@p85                    (overall, alongside the existing p50/80/90/95)
+    ind_f1, ind_r@p80/85/90/95    F1 + recall@precision restricted to IND
+    php_f1, php_r@p80/85/90/95    F1 + recall@precision restricted to PHP
+  Region columns are NaN when the test set has no rows in that region.
+
+* Both heads now print a per-region breakdown right after splits are built
+  (via log_split_breakdown). For each of train/val/test you get the row
+  count, pos/neg counts, group count, batch distribution, AND per-region
+  (n, pos, neg) -- plus a separate region=NaN line for train_only auxiliary
+  rows (e.g. ALLSTAR speakers).

@@ -164,10 +164,25 @@ def assert_no_group_leak(gt: pd.DataFrame, splits: dict[str, np.ndarray]) -> Non
 # gt loading + min_duration filter.
 # ----------------------------------------------------------------------------
 
+# Recognized region values. Anything else collapses to OTHER for bucket logs.
+_REGION_VALUES = {"IND", "PHP"}
+# Batches whose rows count as "ALLSTAR" in the candidate-bucket breakdown.
+ALLSTAR_BATCH_NAMES = {"2676", "2677"}
+
+
 def load_gt_and_filter(data_dir: Path, min_duration: float, log: logging.Logger
                        ) -> pd.DataFrame:
     gt = pd.read_csv(data_dir / "gt.csv")
     log.info("Loaded gt.csv: %d rows", len(gt))
+
+    # CRITICAL: force batch to a string column. pandas auto-infers numeric
+    # values like "2676" as int64 (and partially-numeric concats become
+    # object with mixed int/str entries). Either case makes
+    # gt["batch"].isin({"2676","2677"}) silently return all-False, which
+    # makes --train_only_batches and --train_batches stop working for
+    # ALLSTAR. Symptom: train numbers identical with/without ALLSTAR.
+    if "batch" in gt.columns:
+        gt["batch"] = gt["batch"].astype(str)
 
     gt["label"] = pd.to_numeric(gt["label"], errors="coerce")
     n_before = len(gt)
@@ -185,7 +200,66 @@ def load_gt_and_filter(data_dir: Path, min_duration: float, log: logging.Logger
                       .fillna(0.0) >= min_duration].reset_index(drop=True)
             log.info("min_duration=%.2fs filter: %d -> %d rows",
                      min_duration, n_before, len(gt))
+
+    # Quick presence diagnostic so the user can see ALLSTAR was actually
+    # loaded before training starts.
+    if "batch" in gt.columns:
+        as_n = int(gt["batch"].isin(ALLSTAR_BATCH_NAMES).sum())
+        as_groups = (gt[gt["batch"].isin(ALLSTAR_BATCH_NAMES)]["group_id"].nunique()
+                     if "group_id" in gt.columns else -1)
+        log.info("ALLSTAR rows present in gt: n=%d  unique speakers=%d "
+                 "(batch in %s)", as_n, as_groups, sorted(ALLSTAR_BATCH_NAMES))
     return gt
+
+
+def _bucket_for_row(batch: str, region: str | float) -> str:
+    """One of: ALLSTAR, IND, PHP, OTHER. Used for candidate-count breakdowns
+    so the user can see at a glance how many candidates each split has from
+    each source."""
+    if batch in ALLSTAR_BATCH_NAMES:
+        return "ALLSTAR"
+    r = str(region) if region is not None and region == region else ""  # NaN-safe
+    if r.upper() in _REGION_VALUES:
+        return r.upper()
+    return "OTHER"
+
+
+def bucket_breakdown(gt: pd.DataFrame, row_idx: np.ndarray) -> dict[str, dict[str, int]]:
+    """Returns {bucket: {audios, candidates, pos, neg}} for the given rows."""
+    if len(row_idx) == 0:
+        return {}
+    sub = gt.iloc[row_idx].reset_index(drop=True)
+    batches = sub["batch"].astype(str).to_numpy()
+    regions = (sub["region"].to_numpy() if "region" in sub.columns
+               else np.array([""] * len(sub), dtype=object))
+    buckets = np.array([_bucket_for_row(batches[i], regions[i])
+                        for i in range(len(sub))])
+    has_gid = "group_id" in sub.columns
+    out: dict[str, dict[str, int]] = {}
+    for b in ("IND", "PHP", "ALLSTAR", "OTHER"):
+        mask = buckets == b
+        if not mask.any():
+            continue
+        bucket_rows = sub[mask]
+        out[b] = {
+            "audios": int(mask.sum()),
+            "candidates": int(bucket_rows["group_id"].nunique()) if has_gid else -1,
+            "pos": int((bucket_rows["label"] == 1).sum()),
+            "neg": int((bucket_rows["label"] == 0).sum()),
+        }
+    return out
+
+
+def _format_bucket_breakdown(b: dict[str, dict[str, int]]) -> str:
+    if not b:
+        return "(empty)"
+    parts = []
+    for name in ("IND", "PHP", "ALLSTAR", "OTHER"):
+        if name in b:
+            d = b[name]
+            parts.append(f"{name}: audios={d['audios']} cands={d['candidates']} "
+                         f"(pos={d['pos']}/neg={d['neg']})")
+    return "  |  ".join(parts)
 
 
 # ----------------------------------------------------------------------------
@@ -311,7 +385,7 @@ def compute_metrics(y_true: np.ndarray, p: np.ndarray) -> dict:
         prec, rec, thr = precision_recall_curve(y_true, p)
         prec_t = prec[:-1]
         rec_t = rec[:-1]
-        for target in (0.50, 0.80, 0.90, 0.95):
+        for target in (0.50, 0.80, 0.85, 0.90, 0.95):
             mask = prec_t >= target
             if mask.any():
                 idx = int(np.argmax(np.where(mask, rec_t, -1.0)))
@@ -329,7 +403,7 @@ def compute_metrics(y_true: np.ndarray, p: np.ndarray) -> dict:
                     "threshold": float("nan"),
                 }
     except ValueError:
-        for target in (0.50, 0.80, 0.90, 0.95):
+        for target in (0.50, 0.80, 0.85, 0.90, 0.95):
             rap[f"p{int(target * 100)}"] = {
                 "target_precision": float(target),
                 "achieved_precision": float("nan"),
@@ -353,6 +427,84 @@ def per_slice_metrics(y_true: np.ndarray, p: np.ndarray, slice_vals: np.ndarray,
                  res[str(v)]["best_f1"]["f1"], res[str(v)]["best_f1"]["threshold"],
                  res[str(v)]["thr0.5"]["f1"])
     return res
+
+
+def log_split_breakdown(gt: pd.DataFrame, splits: dict[str, np.ndarray],
+                        log: logging.Logger) -> None:
+    """Detailed split printout. For each of train/val/test prints:
+        - total n, pos, neg, unique candidates
+        - audios per batch
+        - audios per region
+        - audios + candidates per bucket (IND / PHP / ALLSTAR / OTHER)
+    Use this right after assert_no_group_leak so 'only N PHP audios in val'
+    surprises and 'ALLSTAR silently dropped' bugs are immediately visible.
+    """
+    y_full = gt["label"].to_numpy().astype(np.int64)
+    has_region = "region" in gt.columns
+    for k, idx in splits.items():
+        labels = y_full[idx]
+        n_pos = int((labels == 1).sum())
+        n_neg = int((labels == 0).sum())
+        n_tot = max(len(idx), 1)
+        log.info("split %-5s n=%5d  pos=%5d (%.1f%%)  neg=%5d (%.1f%%)  candidates=%5d",
+                 k, len(idx), n_pos, 100 * n_pos / n_tot,
+                 n_neg, 100 * n_neg / n_tot,
+                 gt.iloc[idx]["group_id"].nunique())
+        if "batch" in gt.columns:
+            bcounts = gt.iloc[idx]["batch"].value_counts().to_dict()
+            log.info("  batches: %s", bcounts)
+        if has_region:
+            sub = gt.iloc[idx]
+            region_series = sub["region"].astype("object")
+            seen = sorted([str(r) for r in region_series.dropna().unique()])
+            for region in seen:
+                rmask = (region_series == region).to_numpy()
+                ry = labels[rmask]
+                log.info("  region=%-7s n=%5d  pos=%5d  neg=%5d",
+                         region, int(rmask.sum()),
+                         int((ry == 1).sum()), int((ry == 0).sum()))
+            n_nan = int(region_series.isna().sum())
+            if n_nan:
+                log.info("  region=NaN     n=%5d  (typically train_only "
+                         "auxiliary rows -- e.g. ALLSTAR)", n_nan)
+        # candidate-bucket breakdown (the IND/PHP/ALLSTAR view the user
+        # asked for, expressed in candidates rather than audios so it
+        # matches how the speakers are counted)
+        b = bucket_breakdown(gt, idx)
+        log.info("  buckets: %s", _format_bucket_breakdown(b))
+
+
+def log_variant_prelude(tag: str, gt: pd.DataFrame, splits: dict[str, np.ndarray],
+                        log: logging.Logger) -> None:
+    """One-line bucket summary printed right before each model fits. Cheap;
+    every model gets it so a run's log is self-explanatory."""
+    parts = []
+    for k in ("train", "val", "test"):
+        if k not in splits:
+            continue
+        b = bucket_breakdown(gt, splits[k])
+        cells = []
+        for name in ("IND", "PHP", "ALLSTAR", "OTHER"):
+            if name in b:
+                d = b[name]
+                cells.append(f"{name}={d['candidates']}c/{d['audios']}a")
+        parts.append(f"{k}[n={len(splits[k])}] " + " ".join(cells))
+    log.info("[%s] data:  %s", tag, "    ".join(parts))
+
+
+def extract_region_metrics(m: dict, region: str) -> dict[str, float]:
+    """Pulls best_f1.f1 and recall@p{80,85,90,95} for a single region out of
+    the per_region block built by per_slice_metrics. Returns NaN-filled keys
+    if the region is absent."""
+    pr = (m.get("per_region") or {}).get(region) or {}
+    rap = pr.get("recall_at_precision") or {}
+    return {
+        "f1":  float(pr.get("best_f1", {}).get("f1", float("nan"))),
+        "p80": float(rap.get("p80", {}).get("recall", float("nan"))),
+        "p85": float(rap.get("p85", {}).get("recall", float("nan"))),
+        "p90": float(rap.get("p90", {}).get("recall", float("nan"))),
+        "p95": float(rap.get("p95", {}).get("recall", float("nan"))),
+    }
 
 
 def sweep_threshold(y_val: np.ndarray, p_val: np.ndarray,
