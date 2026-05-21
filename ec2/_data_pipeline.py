@@ -153,7 +153,17 @@ def build_splits(gt: pd.DataFrame, train_batches: list[str],
         raise ValueError(f"No test rows match batches={test_batches} region={test_region_filter}")
 
     test_groups = set(gt.iloc[test_idx]["group_id"].tolist())
-    eligible_mask = pool_mask & ~gt["group_id"].isin(test_groups).to_numpy() & ~test_mask
+    # The fewshot adapt candidates also need to be excluded from the val
+    # sampling pool. Without this, an adapt candidate's rows show up in BOTH
+    # train (via fewshot_idx, appended later) and val (via the kfold of the
+    # eligible pool). assert_no_group_leak then trips. The candidates are
+    # already candidate-disjoint with test by construction.
+    adapt_groups = (set(gt.iloc[fewshot_idx]["group_id"].tolist())
+                    if len(fewshot_idx) else set())
+    exclude_groups = test_groups | adapt_groups
+    eligible_mask = (pool_mask
+                     & ~gt["group_id"].isin(exclude_groups).to_numpy()
+                     & ~test_mask)
     sub = gt[eligible_mask].reset_index().rename(columns={"index": "_orig"})
     if len(sub) == 0:
         raise ValueError(f"No train-pool rows after excluding test groups; "
