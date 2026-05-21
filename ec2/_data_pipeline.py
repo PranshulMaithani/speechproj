@@ -116,7 +116,10 @@ def build_splits(gt: pd.DataFrame, train_batches: list[str],
                 "val":   to_orig[val_local],
                 "test":  to_orig[test_local]}
 
-    test_mask = gt["batch"].isin(test_batches).to_numpy()
+    # .copy() guards against the "output array is read-only" error that some
+    # pandas/numpy versions raise when .to_numpy() returns a non-writeable view
+    # and we then try `test_mask &= ...` below.
+    test_mask = gt["batch"].isin(test_batches).to_numpy().copy()
     if test_region_filter:
         if "region" not in gt.columns:
             raise ValueError("region filter requested but gt has no 'region' column")
