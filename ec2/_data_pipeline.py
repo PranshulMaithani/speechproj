@@ -73,10 +73,20 @@ def build_splits(gt: pd.DataFrame, train_batches: list[str],
                  test_batches: list[str] | None,
                  test_region_filter: str | None,
                  train_only_batches: list[str],
-                 seed: int, log: logging.Logger) -> dict[str, np.ndarray]:
+                 seed: int, log: logging.Logger,
+                 fewshot_frac: float = 0.0,
+                 fewshot_batches: list[str] | None = None
+                 ) -> dict[str, np.ndarray]:
     """train_only_batches: batches whose rows are forced into the train split
     only -- never appear in val/test. Their group_ids are also stripped from
-    the candidate-leak check (they're already disjoint by construction)."""
+    the candidate-leak check (they're already disjoint by construction).
+
+    fewshot_frac > 0 enables few-shot client adaptation: that fraction of
+    candidates from fewshot_batches (default: the test_batches) is moved out
+    of test and into train, candidate-disjoint with the remaining test set.
+    This is the realistic deployment scenario -- you label a small batch
+    from a new client before going live. Only applies in Mode B.
+    """
     train_only_set = set(train_only_batches or [])
     train_only_mask = gt["batch"].isin(train_only_set).to_numpy() if train_only_set else np.zeros(len(gt), dtype=bool)
     train_only_idx = np.where(train_only_mask)[0]
@@ -112,6 +122,29 @@ def build_splits(gt: pd.DataFrame, train_batches: list[str],
             raise ValueError("region filter requested but gt has no 'region' column")
         test_mask &= (gt["region"].astype(str) == test_region_filter).to_numpy()
 
+    # Few-shot client adaptation: carve a fraction of the test-batch candidates
+    # back into train (candidate-disjoint). Their rows are removed from test.
+    fewshot_idx = np.array([], dtype=np.int64)
+    if fewshot_frac > 0.0:
+        fb_set = set(fewshot_batches) if fewshot_batches else set(test_batches)
+        fewshot_mask = gt["batch"].isin(fb_set).to_numpy() & test_mask
+        if fewshot_mask.any():
+            cands = gt.loc[fewshot_mask, "group_id"].unique().tolist()
+            rng = np.random.default_rng(seed)
+            rng.shuffle(cands)
+            n_pick = max(1, int(round(len(cands) * fewshot_frac)))
+            adapt_cands = set(cands[:n_pick])
+            adapt_mask = fewshot_mask & gt["group_id"].isin(adapt_cands).to_numpy()
+            test_mask = test_mask & ~adapt_mask
+            fewshot_idx = np.where(adapt_mask)[0]
+            log.info("fewshot_frac=%.2f  -> %d adapt-train rows from %d/%d "
+                     "candidates of %s (removed from test)",
+                     fewshot_frac, len(fewshot_idx), n_pick, len(cands),
+                     sorted(fb_set))
+        else:
+            log.warning("fewshot_frac=%.2f but fewshot_batches=%s has no rows "
+                        "intersecting test_mask; not adapting", fewshot_frac, fb_set)
+
     test_idx = np.where(test_mask)[0]
     if len(test_idx) == 0:
         raise ValueError(f"No test rows match batches={test_batches} region={test_region_filter}")
@@ -145,9 +178,11 @@ def build_splits(gt: pd.DataFrame, train_batches: list[str],
 
     train_local = np.array([i for i in range(len(sub)) if i not in set(val_local)])
     to_orig = sub["_orig"].to_numpy()
-    train_idx = np.concatenate([to_orig[train_local], train_only_idx])
-    log.info("Split mode B: train=%s test=%s region_filter=%s  + %d train_only rows",
-             train_pool_batches, test_batches, test_region_filter, len(train_only_idx))
+    train_idx = np.concatenate([to_orig[train_local], train_only_idx, fewshot_idx])
+    log.info("Split mode B: train=%s test=%s region_filter=%s  + %d train_only "
+             "rows + %d fewshot-adapt rows",
+             train_pool_batches, test_batches, test_region_filter,
+             len(train_only_idx), len(fewshot_idx))
     return {"train": train_idx,
             "val":   to_orig[val_local],
             "test":  test_idx}
@@ -168,6 +203,20 @@ def assert_no_group_leak(gt: pd.DataFrame, splits: dict[str, np.ndarray]) -> Non
 _REGION_VALUES = {"IND", "PHP"}
 # Batches whose rows count as "ALLSTAR" in the candidate-bucket breakdown.
 ALLSTAR_BATCH_NAMES = {"2676", "2677"}
+
+# Which batches belong to which client. The audios2/4/5 set is one production
+# client; audios6 is a different one (different mic chain, candidate pool,
+# question pool, and is the only batch with PHP region). Per-client
+# standardization centers each client's features on its own mean/std so the
+# downstream model sees client-invariant inputs.
+CLIENT_MAP = {
+    "audios2": "A",
+    "audios4": "A",
+    "audios5": "A",
+    "audios6": "B",
+    "2676": "ALLSTAR",
+    "2677": "ALLSTAR",
+}
 
 
 def load_gt_and_filter(data_dir: Path, min_duration: float, log: logging.Logger
@@ -248,6 +297,54 @@ def bucket_breakdown(gt: pd.DataFrame, row_idx: np.ndarray) -> dict[str, dict[st
             "neg": int((bucket_rows["label"] == 0).sum()),
         }
     return out
+
+
+def per_client_standardize(wavlm_cache: dict, whisper_cache: dict,
+                           gt: pd.DataFrame, log: logging.Logger,
+                           feat_arr: np.ndarray | None = None) -> np.ndarray | None:
+    """Center each client's features (WavLM + Whisper + optionally feat_*) on
+    its own mean / std, computed from ALL of that client's rows. Uses
+    FEATURES only -- no labels touched -- so this is a legitimate
+    unsupervised domain-adaptation step.
+
+    Rationale: audios2/4/5 are one client; audios6 is a different one
+    (different mic, codec, candidate pool, region). WavLM/Whisper mean-pools
+    sit at different absolute locations in feature space per client. Without
+    standardization, the model learns "which client is this" as a confound.
+    With it, the model sees zero-mean unit-variance features in every
+    client's coordinate system -- the threshold-tuning bottleneck observed
+    on a6 (AUC 0.92, F1 0.70) shrinks because the score scale becomes
+    comparable across clients.
+
+    Mutates the cache dicts and feat_arr in place; returns feat_arr.
+    """
+    client = gt["batch"].astype(str).map(CLIENT_MAP).fillna("UNK")
+    log.info("per-client standardize: %s",
+             {k: int(v) for k, v in client.value_counts().items()})
+    for c in sorted(client.unique()):
+        rows = np.where((client == c).to_numpy())[0]
+        if len(rows) < 5:
+            log.warning("  skipping client=%s -- only %d rows", c, len(rows))
+            continue
+        for key in list(wavlm_cache.keys()):
+            arr = wavlm_cache[key]
+            m = arr[rows].mean(axis=0)
+            s = arr[rows].std(axis=0) + 1e-6
+            arr[rows] = (arr[rows] - m) / s
+            wavlm_cache[key] = arr
+        for key in list(whisper_cache.keys()):
+            arr = whisper_cache[key]
+            m = arr[rows].mean(axis=0)
+            s = arr[rows].std(axis=0) + 1e-6
+            arr[rows] = (arr[rows] - m) / s
+            whisper_cache[key] = arr
+        if feat_arr is not None:
+            m = feat_arr[rows].mean(axis=0)
+            s = feat_arr[rows].std(axis=0) + 1e-6
+            feat_arr[rows] = (feat_arr[rows] - m) / s
+        log.info("  client=%-8s rows=%5d  centered (wavlm + whisper%s)",
+                 c, len(rows), " + feat" if feat_arr is not None else "")
+    return feat_arr
 
 
 def _format_bucket_breakdown(b: dict[str, dict[str, int]]) -> str:

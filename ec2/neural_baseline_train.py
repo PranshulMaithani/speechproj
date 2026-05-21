@@ -88,7 +88,8 @@ from _data_pipeline import (WAVLM_LAYERS, assert_no_group_leak, build_splits,
                             compute_metrics, extract_region_metrics,
                             load_cache_reindexed, load_gt_and_filter,
                             log_split_breakdown, log_variant_prelude,
-                            per_slice_metrics, resolve_use_augs, setup_logging)
+                            per_client_standardize, per_slice_metrics,
+                            resolve_use_augs, setup_logging)
 
 # ----------------------------------------------------------------------------
 # Variants.
@@ -97,6 +98,11 @@ from _data_pipeline import (WAVLM_LAYERS, assert_no_group_leak, build_splits,
 ARCH_CONFIG: dict[str, dict] = {
     "default": {"hidden": (512, 256, 128), "dropout": 0.40, "weight_decay": 5e-4},
     "tiny":    {"hidden": (128,),          "dropout": 0.55, "weight_decay": 5e-3},
+    # 'linear' is logistic-regression-on-WavLM+Whisper: no hidden layer, no
+    # nonlinearity. Heavy L2. Sanity baseline -- if it matches 'tiny', the
+    # data is essentially linear in this feature space and the MLP nonlinearity
+    # is just memorizing client artifacts.
+    "linear":  {"hidden": (),              "dropout": 0.00, "weight_decay": 1e-2},
 }
 
 PCA_VARIANTS: list[tuple[str, float | None]] = [
@@ -296,6 +302,19 @@ def main() -> int:
                     help="Include feat_* handcrafted features in the input "
                          "vector. When false, the MLP is trained on WavLM + "
                          "Whisper only.")
+    ap.add_argument("--per_client_standardize", default="false",
+                    choices=["true", "false"],
+                    help="Per-client feature standardization (centers each "
+                         "client's WavLM+Whisper+feat on its own mean/std "
+                         "using features only). Removes first-order client "
+                         "shift -- the main reason audios6 F1 collapses 19pt "
+                         "from the 20%% split.")
+    ap.add_argument("--fewshot_frac", type=float, default=0.0,
+                    help="Few-shot adaptation: fraction of test-batch "
+                         "candidates carved into train (candidate-disjoint, "
+                         "rows removed from test). Use with --test_batches "
+                         "set (Mode B). e.g. 0.20 puts 20%% of audios6 "
+                         "candidates into train and tests on the other 80%%.")
     ap.add_argument("--batch_size", type=int, default=64)
     ap.add_argument("--epochs", type=int, default=60)
     ap.add_argument("--lr", type=float, default=1e-3)
@@ -310,6 +329,7 @@ def main() -> int:
     args = ap.parse_args()
 
     use_text_features = (args.use_text_features == "true")
+    do_per_client_std = (args.per_client_standardize == "true")
     train_batches = [b.strip() for b in args.train_batches.split(",") if b.strip()]
     test_batches = [b.strip() for b in args.test_batches.split(",") if b.strip()]
     train_only_batches = [b.strip() for b in args.train_only_batches.split(",") if b.strip()]
@@ -324,7 +344,9 @@ def main() -> int:
     log.info("data_dir = %s", data_dir)
     log.info("out_dir  = %s", out_dir)
     log.info("cache    = %s", cache_path)
-    log.info("use_text_features = %s", use_text_features)
+    log.info("use_text_features      = %s", use_text_features)
+    log.info("per_client_standardize = %s", do_per_client_std)
+    log.info("fewshot_frac           = %.2f", args.fewshot_frac)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     log.info("device   = %s", device)
 
@@ -374,6 +396,13 @@ def main() -> int:
         else:
             log.info("no feat_* columns -- audio embeddings only")
 
+    # ---- Per-client feature standardization (unsupervised; uses features
+    # only). Best applied before splits so the model never sees client-drift
+    # variance.
+    if do_per_client_std:
+        feat_arr = per_client_standardize(wavlm_cache, whisper_cache, gt, log,
+                                          feat_arr=feat_arr)
+
     def concat(wavlm: np.ndarray, whisper: np.ndarray, feats: np.ndarray | None) -> np.ndarray:
         parts = [wavlm, whisper]
         if feats is not None:
@@ -387,7 +416,8 @@ def main() -> int:
                           test_batches=test_batches if test_batches else None,
                           test_region_filter=test_region_filter,
                           train_only_batches=train_only_batches,
-                          seed=args.seed, log=log)
+                          seed=args.seed, log=log,
+                          fewshot_frac=args.fewshot_frac)
     assert_no_group_leak(gt, splits)
     log_split_breakdown(gt, splits, log)
     log.info("--class_balance=%s will be applied to TRAIN minibatches "

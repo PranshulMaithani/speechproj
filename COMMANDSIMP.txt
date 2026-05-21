@@ -1,0 +1,322 @@
+================================================================================
+COMMANDSIMP.txt -- improvement experiments after cross-tab analysis
+================================================================================
+
+WHY THIS FILE EXISTS
+
+Your prior sweep showed a 19-point F1 collapse from 20% test (0.81) to audios6
+test (0.61). The cross-tabs confirmed this is client-shift: audios2/4/5 are
+client A and audios6 is client B. Two interventions target it directly:
+
+  (1) per-client feature standardization   -- removes first-order client drift
+  (2) few-shot client adaptation           -- the realistic deployment workflow
+
+Plus two cheap-but-important hygiene fixes the cross-tabs revealed:
+
+  (3) drop ALLSTAR             -- it costs 2-3 F1pt on both test sets
+  (4) keep text_features=true  -- helps a6 specifically by ~0.8pt
+  (5) add 'linear' architecture -- sanity baseline (logistic regression)
+
+The new CLI flags live on both ec2/neural_baseline_train.py and
+ec2/xgboost_train.py:
+
+    --per_client_standardize  true | false   (default false)
+    --fewshot_frac            FLOAT          (default 0.0 = disabled)
+
+Placeholders (same as COMMANDS.txt):
+    <UPLOAD>   = the upload/ folder on EC2 (e.g. /opt/data/upload)
+    <RUNS>     = where training outputs land (e.g. /opt/runs)
+
+Every recipe below is independent. Run them in order so the cross-comparison
+through analyze_collated_results.py keeps making sense.
+
+--------------------------------------------------------------------------------
+PRE-FLIGHT (one-time, on EC2)
+--------------------------------------------------------------------------------
+
+# A. confirm the embedding cache exists (no re-extraction needed)
+ls -la <UPLOAD>/embeddings_cache.npz
+
+# B. pull the latest code  (the three changed files: ec2/_data_pipeline.py,
+#    ec2/neural_baseline_train.py, ec2/xgboost_train.py)
+cd <repo>  &&  git pull
+
+# C. verify the three scripts import cleanly
+python -c "import ast, pathlib; [ast.parse(p.read_text()) for p in pathlib.Path('ec2').glob('*.py')]; print('OK')"
+
+--------------------------------------------------------------------------------
+RECIPE 0 -- CLEAN BASELINE  (no ALLSTAR, text on, no per-client-std, no fewshot)
+                            run this once so we have a clean reference number
+--------------------------------------------------------------------------------
+
+# Mode B, audios6 IND test, no ALLSTAR, text features on, NN
+python ec2/neural_baseline_train.py \
+    --data_dir <UPLOAD> \
+    --out_dir  <RUNS>/r0_clean_baseline \
+    --train_batches audios2,audios4,audios5 \
+    --train_only_batches "" \
+    --test_batches  audios6 \
+    --test_region_filter IND \
+    --min_duration 5.0 \
+    --use_text_features true \
+    --per_client_standardize false \
+    --fewshot_frac 0.0
+
+# Same for XGB
+python ec2/xgboost_train.py \
+    --data_dir <UPLOAD> \
+    --out_dir  <RUNS>/r0_clean_baseline \
+    --train_batches audios2,audios4,audios5 \
+    --train_only_batches "" \
+    --test_batches  audios6 \
+    --test_region_filter IND \
+    --min_duration 5.0 \
+    --use_text_features true \
+    --per_client_standardize false \
+    --fewshot_frac 0.0
+
+# Note: linear arch now also runs by default (30 NN variants instead of 20)
+# since ARCH_CONFIG includes 'default', 'tiny', 'linear'.
+
+--------------------------------------------------------------------------------
+RECIPE 1 -- PER-CLIENT STANDARDIZATION  (the 5-line fix; should move the needle)
+--------------------------------------------------------------------------------
+
+python ec2/neural_baseline_train.py \
+    --data_dir <UPLOAD> \
+    --out_dir  <RUNS>/r1_perclient_std \
+    --train_batches audios2,audios4,audios5 \
+    --train_only_batches "" \
+    --test_batches  audios6 \
+    --test_region_filter IND \
+    --min_duration 5.0 \
+    --use_text_features true \
+    --per_client_standardize true \
+    --fewshot_frac 0.0
+
+python ec2/xgboost_train.py \
+    --data_dir <UPLOAD> \
+    --out_dir  <RUNS>/r1_perclient_std \
+    --train_batches audios2,audios4,audios5 \
+    --train_only_batches "" \
+    --test_batches  audios6 \
+    --test_region_filter IND \
+    --min_duration 5.0 \
+    --use_text_features true \
+    --per_client_standardize true \
+    --fewshot_frac 0.0
+
+# What to compare:
+#   r1.summary1.test_best_f1   vs   r0.summary1.test_best_f1
+#   r1.summary1.test_auc       vs   r0.summary1.test_auc        (may not move
+#                                   much -- AUC is already 0.92 on a6)
+#
+# Expected: 3-8 F1 points up on the audios6 test if the diagnosis is right.
+# If r1 is identical to r0, the shift is deeper than first-moment statistics
+# and we go to recipe 3 (few-shot) or beyond.
+
+--------------------------------------------------------------------------------
+RECIPE 2 -- FEW-SHOT 20%  (realistic deployment scenario)
+                          per-client std OFF here so we isolate the few-shot
+                          contribution from recipe 1's
+--------------------------------------------------------------------------------
+
+python ec2/neural_baseline_train.py \
+    --data_dir <UPLOAD> \
+    --out_dir  <RUNS>/r2_fewshot_20pct \
+    --train_batches audios2,audios4,audios5,audios6 \
+    --train_only_batches "" \
+    --test_batches  audios6 \
+    --test_region_filter IND \
+    --min_duration 5.0 \
+    --use_text_features true \
+    --per_client_standardize false \
+    --fewshot_frac 0.20
+
+python ec2/xgboost_train.py \
+    --data_dir <UPLOAD> \
+    --out_dir  <RUNS>/r2_fewshot_20pct \
+    --train_batches audios2,audios4,audios5,audios6 \
+    --train_only_batches "" \
+    --test_batches  audios6 \
+    --test_region_filter IND \
+    --min_duration 5.0 \
+    --use_text_features true \
+    --per_client_standardize false \
+    --fewshot_frac 0.20
+
+# What this does: takes 20% of audios6 candidates (IND ones, since
+# test_region_filter is IND) and puts them in train. Test is the other 80%
+# of audios6 candidates. CANDIDATE-DISJOINT -- enforced by build_splits +
+# assert_no_group_leak.
+
+# Note: --train_batches NOW INCLUDES audios6 so its rows are considered for
+# the pool. The fewshot logic carves the test set candidates back into train.
+
+--------------------------------------------------------------------------------
+RECIPE 3 -- COMBINED  (per-client std + few-shot 0.20)
+                      this is the realistic upper-bound experiment
+--------------------------------------------------------------------------------
+
+python ec2/neural_baseline_train.py \
+    --data_dir <UPLOAD> \
+    --out_dir  <RUNS>/r3_combined \
+    --train_batches audios2,audios4,audios5,audios6 \
+    --train_only_batches "" \
+    --test_batches  audios6 \
+    --test_region_filter IND \
+    --min_duration 5.0 \
+    --use_text_features true \
+    --per_client_standardize true \
+    --fewshot_frac 0.20
+
+python ec2/xgboost_train.py \
+    --data_dir <UPLOAD> \
+    --out_dir  <RUNS>/r3_combined \
+    --train_batches audios2,audios4,audios5,audios6 \
+    --train_only_batches "" \
+    --test_batches  audios6 \
+    --test_region_filter IND \
+    --min_duration 5.0 \
+    --use_text_features true \
+    --per_client_standardize true \
+    --fewshot_frac 0.20
+
+--------------------------------------------------------------------------------
+RECIPE 4 -- FEW-SHOT 30% + AUG ALL  (more adaptation + train-time regularization)
+--------------------------------------------------------------------------------
+
+python ec2/neural_baseline_train.py \
+    --data_dir <UPLOAD> \
+    --out_dir  <RUNS>/r4_combined_30 \
+    --train_batches audios2,audios4,audios5,audios6 \
+    --train_only_batches "" \
+    --test_batches  audios6 \
+    --test_region_filter IND \
+    --min_duration 5.0 \
+    --use_text_features true \
+    --per_client_standardize true \
+    --fewshot_frac 0.30 \
+    --use_augs all
+
+python ec2/xgboost_train.py \
+    --data_dir <UPLOAD> \
+    --out_dir  <RUNS>/r4_combined_30 \
+    --train_batches audios2,audios4,audios5,audios6 \
+    --train_only_batches "" \
+    --test_batches  audios6 \
+    --test_region_filter IND \
+    --min_duration 5.0 \
+    --use_text_features true \
+    --per_client_standardize true \
+    --fewshot_frac 0.30 \
+    --use_augs all
+
+--------------------------------------------------------------------------------
+RECIPE 5 -- PHP-FOCUSED FEW-SHOT  (carve PHP candidates specifically)
+                                   only run after we see PHP performance in
+                                   the IND-focused recipes above
+--------------------------------------------------------------------------------
+
+# Test on audios6 PHP only. Few-shot from audios6 PHP candidates.
+# This tells us whether the model can learn PHP at all when shown some PHP.
+
+python ec2/neural_baseline_train.py \
+    --data_dir <UPLOAD> \
+    --out_dir  <RUNS>/r5_php_fewshot \
+    --train_batches audios2,audios4,audios5,audios6 \
+    --train_only_batches "" \
+    --test_batches  audios6 \
+    --test_region_filter PHP \
+    --min_duration 5.0 \
+    --use_text_features true \
+    --per_client_standardize true \
+    --fewshot_frac 0.30
+
+python ec2/xgboost_train.py \
+    --data_dir <UPLOAD> \
+    --out_dir  <RUNS>/r5_php_fewshot \
+    --train_batches audios2,audios4,audios5,audios6 \
+    --train_only_batches "" \
+    --test_batches  audios6 \
+    --test_region_filter PHP \
+    --min_duration 5.0 \
+    --use_text_features true \
+    --per_client_standardize true \
+    --fewshot_frac 0.30
+
+--------------------------------------------------------------------------------
+COLLATING + ANALYSIS
+--------------------------------------------------------------------------------
+
+# After all recipes finish, collate every summary1.csv + summary2.csv into
+# one xlsx for the analyzer. Pandas one-liner:
+python - <<'PY'
+import glob, os, pandas as pd
+frames = []
+for f in sorted(glob.glob('<RUNS>/*/summary*.csv')):
+    run  = os.path.basename(os.path.dirname(f))
+    df   = pd.read_csv(f)
+    df['run']     = run
+    df['head']    = 'nn' if f.endswith('summary1.csv') else 'xgb'
+    # parse axes from run name (r0_clean_baseline, r1_perclient_std, etc.)
+    df['recipe']  = run.split('_')[0]
+    frames.append(df)
+combined = pd.concat(frames, ignore_index=True)
+combined.to_excel('<RUNS>/collated_v2.xlsx', index=False)
+print('wrote', len(combined), 'rows -> collated_v2.xlsx')
+PY
+
+# Run the analyzer on it.
+python analyze_collated_results.py \
+    --in  <RUNS>/collated_v2.xlsx \
+    --out <RUNS>/report_v2.txt \
+    --axes head,recipe \
+    --top_n 10 \
+    --primary_metric test_best_f1
+
+# Paste report_v2.txt back to Claude for analysis.
+
+--------------------------------------------------------------------------------
+WHAT TO LOOK AT IN report_v2.txt
+--------------------------------------------------------------------------------
+
+1. QUICK TAKEAWAYS section. The "axis impact" table now has 'recipe' as one
+   of the axes -- that's the recipe-level F1 swing. If recipe r1 (per-client
+   std alone) moves the mean F1 by more than 3pt, the diagnosis is right.
+
+2. The 2-axis cross-tab head x recipe. Tells us whether per-client std and
+   few-shot help NN and XGB equally, or whether one head benefits more.
+
+3. BEST per (head x recipe) section -- shows the best single variant per
+   condition. This is the "what would I deploy" number per recipe.
+
+4. The recall@p85, recall@p90 columns: AUC was already 0.92 on a6, the
+   problem was threshold-tuned F1. After per-client std, recall@high-precision
+   should go up substantially (the ranking was good; calibration was off).
+
+--------------------------------------------------------------------------------
+NOTES
+--------------------------------------------------------------------------------
+
+* --per_client_standardize uses FEATURES only -- no labels touched. This is
+  a legitimate unsupervised step. It centers each client's WavLM/Whisper
+  (and feat_*) on its own mean/std, computed from ALL of that client's rows
+  (train + test). Removes first-order client drift.
+
+* --fewshot_frac uses LABELS from the carved candidates. That's the deal:
+  to adapt to a new client you label some of their candidates. Fewshot
+  candidates are candidate-disjoint with test candidates (verified by
+  assert_no_group_leak).
+
+* If a recipe takes too long because of n_augs=8: drop --use_augs all and
+  re-run. Augs added 1pt on average; they're not where the wins are.
+
+* The 'linear' arch is now in ARCH_CONFIG. If linear matches tiny on a6,
+  drop default (it's overfitting client artifacts). If linear LOSES to
+  tiny, keep tiny.
+
+* The ALLSTAR rows still exist in gt.csv -- nothing was deleted. They
+  just aren't in --train_only_batches anymore. To force-include them
+  later (e.g. for an explicit ablation showing they hurt), add back
+  --train_only_batches 2676,2677.

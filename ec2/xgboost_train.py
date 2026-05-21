@@ -64,8 +64,8 @@ from _data_pipeline import (WAVLM_LAYERS, assert_no_group_leak, build_splits,
                             compute_metrics, extract_region_metrics,
                             load_cache_reindexed, load_gt_and_filter,
                             log_split_breakdown, log_variant_prelude,
-                            per_slice_metrics, resolve_use_augs, setup_logging,
-                            sweep_threshold)
+                            per_client_standardize, per_slice_metrics,
+                            resolve_use_augs, setup_logging, sweep_threshold)
 
 
 # ----------------------------------------------------------------------------
@@ -402,12 +402,21 @@ def main() -> int:
                     help="Include feat_* handcrafted features. When false, "
                          "training uses WavLM + Whisper only and text-only "
                          "bases are skipped.")
+    ap.add_argument("--per_client_standardize", default="false",
+                    choices=["true", "false"],
+                    help="Center each client's WavLM+Whisper+feat features "
+                         "on its own mean/std. Removes first-order client "
+                         "shift before training.")
+    ap.add_argument("--fewshot_frac", type=float, default=0.0,
+                    help="Few-shot client adaptation: carve this fraction of "
+                         "test-batch candidates into train (candidate-disjoint).")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--class_balance", default="sampler",
                     choices=["sampler", "pos_weight", "both", "none"])
     args = ap.parse_args()
 
     use_text_features = (args.use_text_features == "true")
+    do_per_client_std = (args.per_client_standardize == "true")
     train_batches = [b.strip() for b in args.train_batches.split(",") if b.strip()]
     test_batches = [b.strip() for b in args.test_batches.split(",") if b.strip()]
     train_only_batches = [b.strip() for b in args.train_only_batches.split(",") if b.strip()]
@@ -422,7 +431,9 @@ def main() -> int:
     log.info("data_dir = %s", data_dir)
     log.info("out_dir  = %s", out_dir)
     log.info("cache    = %s", cache_path)
-    log.info("use_text_features = %s", use_text_features)
+    log.info("use_text_features      = %s", use_text_features)
+    log.info("per_client_standardize = %s", do_per_client_std)
+    log.info("fewshot_frac           = %.2f", args.fewshot_frac)
 
     np.random.seed(args.seed)
 
@@ -471,12 +482,19 @@ def main() -> int:
     feat_available = set(feat_cols)
     y_full = gt["label"].to_numpy().astype(np.int64)
 
+    # ---- Per-client standardization (unsupervised; features only)
+    if do_per_client_std:
+        feat_arr_global = per_client_standardize(wavlm_cache, whisper_cache,
+                                                 gt, log,
+                                                 feat_arr=feat_arr_global)
+
     # ---- splits + group-leak check + clear per-region breakdown
     splits = build_splits(gt, train_batches=train_batches,
                           test_batches=test_batches if test_batches else None,
                           test_region_filter=test_region_filter,
                           train_only_batches=train_only_batches,
-                          seed=args.seed, log=log)
+                          seed=args.seed, log=log,
+                          fewshot_frac=args.fewshot_frac)
     assert_no_group_leak(gt, splits)
     log_split_breakdown(gt, splits, log)
 
