@@ -36,6 +36,20 @@ copy-pasted whole into a chat reply):
  13. REGION GAP                   -- |ind_f1 - php_f1| smallest (balanced) /
                                      largest (uneven)
 
+  -- recipe-focused sections (require a 'recipe' column; from COMMANDSIMP collation) --
+
+ 14. DELTA VS BASELINE recipe     -- per (head, variant): metric delta of every
+                                     non-baseline recipe vs --baseline_recipe.
+                                     This is THE table for "did R1..R5 help?"
+ 15. RECIPE x VARIANT PIVOT       -- heatmap-style (mean test_best_f1) per head
+ 16. BEST VARIANT PER (head,recipe) -- top 3 per (head, recipe), full metrics
+ 17. ARCH FAMILY x RECIPE         -- linear vs tiny vs default sanity check;
+                                     overfitting indicator
+ 18. CALIBRATION FOCUS            -- mean high-precision recall per recipe;
+                                     this is where per-client-std wins should
+                                     show (AUC was already 0.92)
+ 19. PER-RECIPE REGION            -- IND vs PHP per recipe; was R5 worth it?
+
 If your .xlsx has multiple sheets, pass --sheet <name_or_index>.
 """
 
@@ -59,6 +73,25 @@ RECALL_METRICS = ["recall@p50", "recall@p80", "recall@p85", "recall@p90",
                   "recall@p95"]
 REGION_RECALL_METRICS = [f"{r}_r@p{p}" for r in ("ind", "php")
                          for p in (80, 85, 90, 95)]
+
+# Recipe-focused analysis: metrics we want side-by-side per recipe.
+RECIPE_METRICS = ["test_best_f1", "test_auc", "test_ap",
+                  "recall@p85", "recall@p90", "recall@p95",
+                  "ind_f1", "php_f1"]
+
+# Arch families inferred from variant name prefix.
+ARCH_FAMILIES = ("default", "tiny", "linear", "tierA_pick", "wavlm_xgb",
+                 "whisper_xgb", "text_top20_xgb", "text_all_xgb",
+                 "text_stylo_xgb", "everything_xgb")
+
+
+def infer_arch_family(variant: str) -> str:
+    if not isinstance(variant, str):
+        return "other"
+    for fam in ARCH_FAMILIES:
+        if variant.startswith(fam):
+            return fam
+    return "other"
 
 
 def detect_axes(df: pd.DataFrame, exclude: set[str]) -> list[str]:
@@ -246,6 +279,193 @@ def write_quick_takeaways(out, df, axes: list[str], metric: str) -> None:
             out.write("\n")
 
 
+def write_recipe_delta_vs_baseline(out, df, baseline: str, metrics: list[str]) -> None:
+    """For each non-baseline recipe, per (head, variant): metric delta vs baseline.
+
+    This is the *primary* table for evaluating whether per-client std / few-shot /
+    augs actually moved the needle. The baseline row is the reference for that
+    (head, variant). Shows top winners and losers per recipe."""
+    if "recipe" not in df.columns or "variant" not in df.columns:
+        return
+    if baseline not in set(df["recipe"].dropna().astype(str)):
+        out.write(fmt_section(
+            f"14. DELTA VS BASELINE recipe='{baseline}'  (baseline missing -- skipping)"))
+        return
+    head_col = "head" if "head" in df.columns else None
+    keys = ["variant"] + ([head_col] if head_col else [])
+    metrics = [m for m in metrics if m in df.columns]
+    if not metrics:
+        return
+
+    base = df[df["recipe"].astype(str) == baseline][keys + metrics]
+    # if duplicates in baseline (e.g. multiple seeds), average them
+    base = base.groupby(keys, dropna=False)[metrics].mean().reset_index()
+    base = base.rename(columns={m: f"{m}_base" for m in metrics})
+
+    out.write(fmt_section(
+        f"14. DELTA VS BASELINE recipe='{baseline}'  (per head x variant; sorted by delta_test_best_f1)"))
+
+    other_recipes = sorted(set(df["recipe"].astype(str)) - {baseline})
+    for rec in other_recipes:
+        sub = df[df["recipe"].astype(str) == rec][keys + metrics]
+        sub = sub.groupby(keys, dropna=False)[metrics].mean().reset_index()
+        merged = sub.merge(base, on=keys, how="inner")
+        if merged.empty:
+            out.write(fmt_subsection(f"recipe={rec}: no overlapping (head, variant) rows"))
+            continue
+        for m in metrics:
+            merged[f"d_{m}"] = merged[m] - merged[f"{m}_base"]
+        # display columns: keys + (metric, baseline, delta) for the primary metric,
+        # then deltas for the rest
+        primary = "test_best_f1" if "test_best_f1" in metrics else metrics[0]
+        show_cols = keys + [primary, f"{primary}_base", f"d_{primary}"]
+        for m in metrics:
+            if m != primary:
+                show_cols.append(f"d_{m}")
+        out.write(fmt_subsection(
+            f"recipe={rec}  vs  {baseline}   (n_overlap={len(merged)})"))
+        sorted_df = merged.sort_values(f"d_{primary}", ascending=False).round(4)
+        out.write("TOP-10 WINNERS:\n")
+        out.write(safe_df_string(sorted_df[show_cols], max_rows=10))
+        out.write("\n\nBOTTOM-5 LOSERS:\n")
+        out.write(safe_df_string(sorted_df[show_cols].tail(5)))
+        out.write("\n\nMEAN deltas across all variants:\n")
+        delta_means = {m: round(merged[f"d_{m}"].mean(), 4) for m in metrics}
+        out.write(pd.DataFrame([delta_means]).to_string(index=False))
+        out.write("\n")
+
+
+def write_recipe_variant_pivot(out, df, metric: str) -> None:
+    """recipe x variant heatmap-style pivot. Separate pivot per head."""
+    if "recipe" not in df.columns or "variant" not in df.columns:
+        return
+    if metric not in df.columns:
+        return
+    out.write(fmt_section(f"15. RECIPE x VARIANT PIVOT  (mean {metric}; one pivot per head)"))
+    if "head" in df.columns:
+        for h, sub in df.groupby("head", dropna=False):
+            out.write(fmt_subsection(f"head={h}   n={len(sub)}"))
+            tab = (sub.pivot_table(values=metric, index="variant",
+                                    columns="recipe", aggfunc="mean")
+                      .round(4))
+            # sort variants by mean across recipes desc for readability
+            tab = tab.assign(_mean=tab.mean(axis=1)).sort_values("_mean", ascending=False).drop(columns="_mean")
+            out.write(tab.to_string(na_rep="NaN"))
+            out.write("\n")
+    else:
+        tab = (df.pivot_table(values=metric, index="variant",
+                              columns="recipe", aggfunc="mean")
+                 .round(4))
+        out.write(tab.to_string(na_rep="NaN"))
+        out.write("\n")
+
+
+def write_best_per_recipe(out, df, axes: list[str]) -> None:
+    """Top 3 variants per (head, recipe) with full metric breakdown.
+    This is the 'what would I deploy' number per recipe."""
+    if "recipe" not in df.columns:
+        return
+    if "test_best_f1" not in df.columns:
+        return
+    out.write(fmt_section("16. BEST VARIANT PER (head, recipe)  -- top 3 each, full metrics"))
+    keys = [c for c in ["head", "recipe"] if c in df.columns]
+    metric_cols = [c for c in RECIPE_METRICS if c in df.columns]
+    show_cols = (["variant"] + [a for a in axes if a not in keys and a in df.columns]
+                 + metric_cols)
+    for key_vals, sub in df.groupby(keys, dropna=False):
+        if not isinstance(key_vals, tuple):
+            key_vals = (key_vals,)
+        tag = "  ".join(f"{k}={v}" for k, v in zip(keys, key_vals))
+        out.write(fmt_subsection(f"{tag}   n={len(sub)}"))
+        top = sub.sort_values("test_best_f1", ascending=False).head(3)
+        out.write(safe_df_string(top[[c for c in show_cols if c in top.columns]]))
+        out.write("\n")
+
+
+def write_arch_family_summary(out, df) -> None:
+    """Mean F1 / recall@p85 per arch family per recipe.
+
+    If 'linear' matches 'tiny': overfitting indicator (only-first-moment signal).
+    If 'tiny' beats 'default': default is overfitting client-A artifacts.
+    """
+    if "variant" not in df.columns or "test_best_f1" not in df.columns:
+        return
+    df = df.copy()
+    df["arch_family"] = df["variant"].apply(infer_arch_family)
+    out.write(fmt_section("17. ARCH FAMILY x RECIPE  (linear vs tiny vs default -- overfitting check)"))
+    metrics_show = [m for m in ("test_best_f1", "test_auc", "recall@p85", "recall@p90")
+                    if m in df.columns]
+    if not metrics_show:
+        return
+    group_cols = [c for c in ("head", "recipe") if c in df.columns] + ["arch_family"]
+    for m in metrics_show:
+        out.write(fmt_subsection(f"mean({m})  grouped by {group_cols}"))
+        tab = (df.groupby(group_cols, dropna=False)[m]
+                 .agg(mean="mean", n="count")
+                 .round(4))
+        out.write(tab.to_string())
+        out.write("\n")
+
+
+def write_calibration_focus(out, df) -> None:
+    """audios6 calibration was the bottleneck (AUC=0.92, F1=0.61).
+
+    Per recipe: mean recall@p85, p90, p95 across all variants -- shows whether
+    per-client-std / few-shot improved CALIBRATION specifically (vs ranking,
+    which was already fine)."""
+    if "recipe" not in df.columns:
+        return
+    recall_cols = [c for c in ("recall@p80", "recall@p85", "recall@p90", "recall@p95")
+                   if c in df.columns]
+    if not recall_cols:
+        return
+    out.write(fmt_section(
+        "18. CALIBRATION FOCUS  (mean high-precision recall per recipe; AUC was already 0.92 -- this is where wins should show)"))
+    group_cols = [c for c in ("head", "recipe") if c in df.columns]
+    tab = (df.groupby(group_cols, dropna=False)[recall_cols]
+             .mean()
+             .round(4))
+    out.write(tab.to_string())
+    out.write("\n")
+    if "test_auc" in df.columns:
+        out.write(fmt_subsection("companion: mean test_auc per recipe (ranking quality -- baseline 0.92)"))
+        auc_tab = (df.groupby(group_cols, dropna=False)["test_auc"]
+                     .mean().round(4))
+        out.write(auc_tab.to_string())
+        out.write("\n")
+
+
+def write_region_per_recipe(out, df) -> None:
+    """Per-recipe IND vs PHP performance.
+
+    R0-R4 are IND-tested; R5 is PHP-tested. This table makes it explicit
+    which recipe tested which region, and whether PHP-focused few-shot (R5)
+    actually moved PHP."""
+    if "recipe" not in df.columns:
+        return
+    keep = [c for c in ("ind_f1", "php_f1", "ind_r@p85", "php_r@p85",
+                        "ind_r@p90", "php_r@p90", "test_region_filter")
+            if c in df.columns]
+    if not keep:
+        return
+    out.write(fmt_section("19. PER-RECIPE REGION PERFORMANCE  (IND vs PHP; was R5 worth it?)"))
+    group_cols = [c for c in ("head", "recipe") if c in df.columns]
+    metric_cols = [c for c in ("ind_f1", "php_f1", "ind_r@p85", "php_r@p85",
+                                "ind_r@p90", "php_r@p90") if c in df.columns]
+    if metric_cols:
+        tab = (df.groupby(group_cols, dropna=False)[metric_cols]
+                 .mean()
+                 .round(4))
+        out.write(tab.to_string(na_rep="NaN"))
+        out.write("\n")
+    if "test_region_filter" in df.columns:
+        out.write(fmt_subsection("which region was each recipe tested on?"))
+        rf = (df.groupby([c for c in ("recipe",) if c in df.columns])["test_region_filter"]
+                .agg(lambda s: ",".join(sorted(set(map(str, s.dropna()))))))
+        out.write(rf.to_string())
+        out.write("\n")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--in", dest="input_path", default="collated_results.xlsx")
@@ -256,6 +476,9 @@ def main() -> int:
     ap.add_argument("--sheet", default="0",
                     help="sheet name or index (default 0 = first sheet)")
     ap.add_argument("--primary_metric", default="test_best_f1")
+    ap.add_argument("--baseline_recipe", default="r0",
+                    help="recipe name used as the reference in the delta tables "
+                         "(default 'r0'). Set to '' to skip the delta section.")
     args = ap.parse_args()
 
     in_path = Path(args.input_path)
@@ -361,6 +584,33 @@ def main() -> int:
 
         # 13. Region gap
         write_region_gap(out, df, axes)
+
+        # ---- Recipe-focused sections (added for COMMANDSIMP R0-R5 evaluation) ----
+        # These are the sections to paste back; they directly answer
+        # "did per-client std / few-shot / augs move the audios6 number?"
+
+        # 14. Delta vs baseline (per (head, variant), per recipe)
+        if args.baseline_recipe:
+            write_recipe_delta_vs_baseline(
+                out, df,
+                baseline=args.baseline_recipe,
+                metrics=RECIPE_METRICS,
+            )
+
+        # 15. Recipe x variant pivot
+        write_recipe_variant_pivot(out, df, metric=metric)
+
+        # 16. Best variant per (head, recipe)
+        write_best_per_recipe(out, df, axes)
+
+        # 17. Arch family x recipe (linear vs tiny vs default check)
+        write_arch_family_summary(out, df)
+
+        # 18. Calibration focus
+        write_calibration_focus(out, df)
+
+        # 19. Per-recipe region performance (IND vs PHP)
+        write_region_per_recipe(out, df)
 
         # Closing note
         out.write(fmt_section("END OF REPORT"))

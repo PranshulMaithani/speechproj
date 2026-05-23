@@ -273,9 +273,23 @@ python analyze_collated_results.py \
     --out <RUNS>/report_v2.txt \
     --axes head,recipe \
     --top_n 10 \
-    --primary_metric test_best_f1
+    --primary_metric test_best_f1 \
+    --baseline_recipe r0
 
-# Paste report_v2.txt back to Claude for analysis.
+# Paste report_v2.txt back to Claude for analysis. The sections that matter most
+# (paste at minimum these four):
+#
+#   14. DELTA VS BASELINE recipe='r0'   -- did r1..r5 actually beat r0, per variant?
+#   15. RECIPE x VARIANT PIVOT          -- heatmap of mean F1 over (variant x recipe)
+#   16. BEST VARIANT PER (head, recipe) -- what would I deploy per recipe
+#   18. CALIBRATION FOCUS               -- did recall@p85/p90/p95 improve?
+#
+# Useful follow-ups if results are surprising:
+#   17. ARCH FAMILY x RECIPE  (overfitting check: linear vs tiny vs default)
+#   19. PER-RECIPE REGION     (PHP performance + which region each recipe tested)
+#
+# The QUICK TAKEAWAYS section at the top now includes 'recipe' as an axis -- the
+# "axis impact" max-minus-min on the recipe row is the recipe-level F1 swing.
 
 --------------------------------------------------------------------------------
 WHAT TO LOOK AT IN report_v2.txt
