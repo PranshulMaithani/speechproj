@@ -95,7 +95,9 @@ python ec2/xgboost_train_v2.py \
     --target_prior -1.0
 
 --------------------------------------------------------------------------------
-3. COLLATE  -- rebuilds collated_v3.xlsx including r0..r5 + the new r6 runs
+3. COLLATE  -- rebuilds collated_v3.xlsx; uses FULL run name as recipe so
+               r6_drop_prior_fs10 and r6_no_fs are DISTINCT recipes
+               (the earlier split-on-underscore collapsed them to 'r6')
 --------------------------------------------------------------------------------
 
 python -c "
@@ -106,15 +108,16 @@ for f in sorted(glob.glob('/home/ubuntu/nn/runs/*/summary*.csv')):
     df = pd.read_csv(f)
     df['run']    = run
     df['head']   = 'nn' if f.endswith('summary1.csv') else 'xgb'
-    df['recipe'] = run.split('_')[0]
+    df['recipe'] = run     # full name; not run.split('_')[0]
     frames.append(df)
 out = pd.concat(frames, ignore_index=True)
 out.to_excel('/home/ubuntu/nn/runs/collated_v3.xlsx', index=False)
-print('wrote', len(out), 'rows -> collated_v3.xlsx')
+print('wrote', len(out), 'rows ; recipes:', sorted(out['recipe'].unique()))
 "
 
 --------------------------------------------------------------------------------
-4. ANALYZE
+4. ANALYZE  -- baseline = r6_no_fs so section 14 deltas = pure fewshot effect
+              (use r0_clean_baseline only if you actually ran one; see below)
 --------------------------------------------------------------------------------
 
 python analyze_collated_results.py \
@@ -123,7 +126,47 @@ python analyze_collated_results.py \
     --axes head,recipe \
     --top_n 10 \
     --primary_metric test_best_f1 \
-    --baseline_recipe r0
+    --baseline_recipe r6_no_fs
+
+--------------------------------------------------------------------------------
+4b. OPTIONAL: run an r0 baseline on EC2 if you want v2-vs-v1 attribution
+              (uses v2 script with all v2 flags OFF -> matches v1 behavior)
+--------------------------------------------------------------------------------
+
+# NN
+python ec2/neural_baseline_train_v2.py \
+    --data_dir /home/ubuntu/nn/data \
+    --out_dir  /home/ubuntu/nn/runs/r0_clean_baseline \
+    --train_batches audios2,audios4,audios5 \
+    --train_only_batches "" \
+    --test_batches  audios6 \
+    --test_region_filter IND \
+    --min_duration 5.0 \
+    --use_text_features true \
+    --per_client_standardize false \
+    --fewshot_frac 0.0 \
+    --drop_high_ks_features false \
+    --prior_correction false \
+    --target_prior -1.0
+
+# XGB
+python ec2/xgboost_train_v2.py \
+    --data_dir /home/ubuntu/nn/data \
+    --out_dir  /home/ubuntu/nn/runs/r0_clean_baseline \
+    --train_batches audios2,audios4,audios5 \
+    --train_only_batches "" \
+    --test_batches  audios6 \
+    --test_region_filter IND \
+    --min_duration 5.0 \
+    --use_text_features true \
+    --per_client_standardize false \
+    --fewshot_frac 0.0 \
+    --drop_high_ks_features false \
+    --prior_correction false \
+    --target_prior -1.0
+
+# Then re-collate (same command as section 3) and re-analyze with:
+#     --baseline_recipe r0_clean_baseline
 
 --------------------------------------------------------------------------------
 RUN-EVERYTHING ONE-LINER  (paste once, walk away; ~2-3 hours)
