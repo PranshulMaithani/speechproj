@@ -18,14 +18,37 @@ writes the result into gt.csv under feat_n_words_asr. Idempotent: skips rows
 that already have a numeric value unless --force.
 
 ================================================================================
-EXACT RUN COMMANDS
+WHERE TO RUN THIS  (PII CONSTRAINT)
+================================================================================
+RUN THIS ON THE COMPANY LAPTOP, NOT ON EC2.
+
+Transcripts contain raw candidate speech and are PII-gated -- they must not
+leave the laptop. gt.csv with G_NNNNN anonymized filenames IS allowed on EC2.
+
+Workflow:
+  1. On LAPTOP: run this script. It modifies gt.csv in place.
+  2. From LAPTOP -> EC2: scp the updated gt.csv only. Leave transcripts.json
+     on the laptop.
+
+Easier alternative: don't backfill at all. The v2 training scripts already
+include feat_n_words_asr in HIGH_KS_FEATURES, so --drop_high_ks_features=true
+removes it from training. The feature was all-NaN on audios6 anyway (silently
+filled to 0.0 during training), so dropping it loses nothing on client B.
+Only run this backfill if you specifically want to keep word-count as a
+training signal on client A.
+
+================================================================================
+EXACT RUN COMMANDS  (run on LAPTOP)
 ================================================================================
 
 # Default: backfill ONLY audios6 (the one batch with the gap)
 python ec2/backfill_n_words_asr.py \\
-    --data_dir <UPLOAD> \\
-    --transcripts <UPLOAD>/transcripts.json \\
+    --data_dir <LAPTOP_DATA_DIR> \\
+    --transcripts <LAPTOP_DATA_DIR>/transcripts.json \\
     --batches audios6
+
+# Then upload ONLY the updated gt.csv to EC2:
+#   scp <LAPTOP_DATA_DIR>/gt.csv ubuntu@<ec2>:/home/ubuntu/nn/data/gt.csv
 
 # Multiple batches at once (comma-separated)
 python ec2/backfill_n_words_asr.py \\

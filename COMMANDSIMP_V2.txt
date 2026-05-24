@@ -1,0 +1,186 @@
+================================================================================
+COMMANDSIMP_V2.txt -- v2 training commands for EC2 (drop + prior + fewshot)
+================================================================================
+
+Paths assume:
+    repo       = ~/speech3
+    data dir   = /home/ubuntu/nn/data
+    runs dir   = /home/ubuntu/nn/runs
+Adjust if yours differ.
+
+Two recipes are run, both committing to dropping the 18 high-KS features:
+
+    r6_drop_prior_fs10  = drop + prior + fewshot 0.10  (headline recipe)
+    r6_no_fs            = drop + prior, no fewshot     (unsupervised version)
+
+After both finish, collate with the existing r0..r5 results and analyze.
+
+--------------------------------------------------------------------------------
+0. PRE-FLIGHT
+--------------------------------------------------------------------------------
+
+cd ~/speech3 && git pull
+
+--------------------------------------------------------------------------------
+1. R6  -- drop + prior + fewshot 10%  (headline recipe)
+--------------------------------------------------------------------------------
+
+# NN
+python ec2/neural_baseline_train_v2.py \
+    --data_dir /home/ubuntu/nn/data \
+    --out_dir  /home/ubuntu/nn/runs/r6_drop_prior_fs10 \
+    --train_batches audios2,audios4,audios5,audios6 \
+    --train_only_batches "" \
+    --test_batches  audios6 \
+    --test_region_filter IND \
+    --min_duration 5.0 \
+    --use_text_features true \
+    --per_client_standardize false \
+    --fewshot_frac 0.10 \
+    --drop_high_ks_features true \
+    --prior_correction true \
+    --target_prior -1.0
+
+# XGB
+python ec2/xgboost_train_v2.py \
+    --data_dir /home/ubuntu/nn/data \
+    --out_dir  /home/ubuntu/nn/runs/r6_drop_prior_fs10 \
+    --train_batches audios2,audios4,audios5,audios6 \
+    --train_only_batches "" \
+    --test_batches  audios6 \
+    --test_region_filter IND \
+    --min_duration 5.0 \
+    --use_text_features true \
+    --per_client_standardize false \
+    --fewshot_frac 0.10 \
+    --drop_high_ks_features true \
+    --prior_correction true \
+    --target_prior -1.0
+
+--------------------------------------------------------------------------------
+2. R6_no_fs  -- drop + prior, NO fewshot
+                (isolates "how much improvement without any new labels?")
+--------------------------------------------------------------------------------
+
+# NN
+python ec2/neural_baseline_train_v2.py \
+    --data_dir /home/ubuntu/nn/data \
+    --out_dir  /home/ubuntu/nn/runs/r6_no_fs \
+    --train_batches audios2,audios4,audios5 \
+    --train_only_batches "" \
+    --test_batches  audios6 \
+    --test_region_filter IND \
+    --min_duration 5.0 \
+    --use_text_features true \
+    --per_client_standardize false \
+    --fewshot_frac 0.0 \
+    --drop_high_ks_features true \
+    --prior_correction true \
+    --target_prior -1.0
+
+# XGB
+python ec2/xgboost_train_v2.py \
+    --data_dir /home/ubuntu/nn/data \
+    --out_dir  /home/ubuntu/nn/runs/r6_no_fs \
+    --train_batches audios2,audios4,audios5 \
+    --train_only_batches "" \
+    --test_batches  audios6 \
+    --test_region_filter IND \
+    --min_duration 5.0 \
+    --use_text_features true \
+    --per_client_standardize false \
+    --fewshot_frac 0.0 \
+    --drop_high_ks_features true \
+    --prior_correction true \
+    --target_prior -1.0
+
+--------------------------------------------------------------------------------
+3. COLLATE  -- rebuilds collated_v3.xlsx including r0..r5 + the new r6 runs
+--------------------------------------------------------------------------------
+
+python -c "
+import glob, os, pandas as pd
+frames = []
+for f in sorted(glob.glob('/home/ubuntu/nn/runs/*/summary*.csv')):
+    run = os.path.basename(os.path.dirname(f))
+    df = pd.read_csv(f)
+    df['run']    = run
+    df['head']   = 'nn' if f.endswith('summary1.csv') else 'xgb'
+    df['recipe'] = run.split('_')[0]
+    frames.append(df)
+out = pd.concat(frames, ignore_index=True)
+out.to_excel('/home/ubuntu/nn/runs/collated_v3.xlsx', index=False)
+print('wrote', len(out), 'rows -> collated_v3.xlsx')
+"
+
+--------------------------------------------------------------------------------
+4. ANALYZE
+--------------------------------------------------------------------------------
+
+python analyze_collated_results.py \
+    --in  /home/ubuntu/nn/runs/collated_v3.xlsx \
+    --out /home/ubuntu/nn/runs/report_v3.txt \
+    --axes head,recipe \
+    --top_n 10 \
+    --primary_metric test_best_f1 \
+    --baseline_recipe r0
+
+--------------------------------------------------------------------------------
+RUN-EVERYTHING ONE-LINER  (paste once, walk away; ~2-3 hours)
+--------------------------------------------------------------------------------
+
+cd ~/speech3 && git pull \
+&& python ec2/neural_baseline_train_v2.py --data_dir /home/ubuntu/nn/data --out_dir /home/ubuntu/nn/runs/r6_drop_prior_fs10 --train_batches audios2,audios4,audios5,audios6 --train_only_batches "" --test_batches audios6 --test_region_filter IND --min_duration 5.0 --use_text_features true --per_client_standardize false --fewshot_frac 0.10 --drop_high_ks_features true --prior_correction true --target_prior -1.0 \
+&& python ec2/xgboost_train_v2.py --data_dir /home/ubuntu/nn/data --out_dir /home/ubuntu/nn/runs/r6_drop_prior_fs10 --train_batches audios2,audios4,audios5,audios6 --train_only_batches "" --test_batches audios6 --test_region_filter IND --min_duration 5.0 --use_text_features true --per_client_standardize false --fewshot_frac 0.10 --drop_high_ks_features true --prior_correction true --target_prior -1.0 \
+&& python ec2/neural_baseline_train_v2.py --data_dir /home/ubuntu/nn/data --out_dir /home/ubuntu/nn/runs/r6_no_fs --train_batches audios2,audios4,audios5 --train_only_batches "" --test_batches audios6 --test_region_filter IND --min_duration 5.0 --use_text_features true --per_client_standardize false --fewshot_frac 0.0 --drop_high_ks_features true --prior_correction true --target_prior -1.0 \
+&& python ec2/xgboost_train_v2.py --data_dir /home/ubuntu/nn/data --out_dir /home/ubuntu/nn/runs/r6_no_fs --train_batches audios2,audios4,audios5 --train_only_batches "" --test_batches audios6 --test_region_filter IND --min_duration 5.0 --use_text_features true --per_client_standardize false --fewshot_frac 0.0 --drop_high_ks_features true --prior_correction true --target_prior -1.0
+
+# Then run sections 3 + 4 (collate + analyze) once the chain finishes.
+
+--------------------------------------------------------------------------------
+DISCONNECT-SAFETY  (use if your SSH session might drop)
+--------------------------------------------------------------------------------
+
+# Wrap the long chain in nohup; output streams to ~/r6_run.log
+nohup bash -c 'cd ~/speech3 && git pull && [...the long chain above...]' > ~/r6_run.log 2>&1 &
+
+# Watch progress
+tail -f ~/r6_run.log
+
+# Or use screen/tmux instead:
+screen -S r6        # then paste commands; Ctrl-A D to detach; `screen -r r6` to reattach
+
+--------------------------------------------------------------------------------
+WHAT TO PASTE BACK FROM report_v3.txt
+--------------------------------------------------------------------------------
+
+  Section 14  DELTA VS BASELINE r0  -- specifically the r6 and r6_no_fs blocks
+                                       (top-10 winners + mean delta)
+  Section 16  BEST per (head, recipe) -- the r6 and r6_no_fs rows
+  Section 18  CALIBRATION FOCUS       -- recall@p85/90/95 per recipe
+
+That's enough to tell whether v2 paid off and which ingredient
+(drop / prior / fewshot) is doing the work.
+
+--------------------------------------------------------------------------------
+NOTES
+--------------------------------------------------------------------------------
+
+* feat_n_words_asr is in HIGH_KS_FEATURES so --drop_high_ks_features=true
+  removes it. No backfill needed (and the backfill must run on the company
+  laptop anyway -- transcripts are PII-gated, never on EC2).
+
+* prior_correction is MONOTONIC. test_best_f1 will NOT change between
+  prior_correction=true and false -- the sweep finds the same max. What
+  changes is test_f1@0.5 and the optimal threshold value. If you compare
+  r6 vs r6_no_fs and best_f1 looks similar, that's prior_correction
+  behaving correctly, NOT a no-op of feature drop.
+
+* The win, if there is one, will show up as:
+    - test_best_f1 UP on r6 vs r0 (feature drop + fewshot doing work)
+    - mean recall@p85/p90 UP on r6 (calibration improved)
+    - test_auc roughly flat (ranking was already 0.92)
+
+* If r6 doesn't beat r0 on test_best_f1, the v2 hypothesis is wrong; we
+  pivot to a different intervention (BN adapters, MMD, label-only deploy
+  calibration via isotonic). Don't iterate further on this branch.
