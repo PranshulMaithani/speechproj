@@ -121,20 +121,89 @@ def main() -> int:
     label = gt_kb["label"].astype(int).to_numpy()
     keep_idx = np.where(keep)[0]
 
-    # Slice every feature group down to the kept rows
+    # Slice every feature group down to the kept rows.
+    # Mirror the training scripts: feat_* is coerced to numeric and NaN -> 0.0
+    # (xgboost_train.py:471, neural_baseline_train.py:387). For wavlm/whisper
+    # we also nan_to_num as a safety net in case extraction wrote NaN.
     groups: dict[str, np.ndarray] = {}
     for layer in WAVLM_LAYERS:
-        groups[f"wavlm_{layer}"] = wavlm_by_layer_aug[(layer, "orig")][keep_idx]
-    groups["whisper"] = whisper_by_aug["orig"][keep_idx]
+        arr = wavlm_by_layer_aug[(layer, "orig")][keep_idx]
+        groups[f"wavlm_{layer}"] = np.nan_to_num(arr, nan=0.0,
+                                                 posinf=0.0, neginf=0.0)
+    arr = whisper_by_aug["orig"][keep_idx]
+    groups["whisper"] = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+
     text_cols = [c for c in gt_kb.columns if c.startswith("feat_")]
+    nan_rates: dict[str, dict[str, float]] = {}  # group -> {A_rate, B_rate}
     if text_cols:
-        groups["text_feats"] = gt_kb[text_cols].to_numpy(dtype=np.float32)
+        raw_text = gt_kb[text_cols].apply(pd.to_numeric, errors="coerce")
+        # NaN-rate accounting BEFORE we fill, so we can report it.
+        nan_a = raw_text.loc[domain == 0].isna().mean(axis=0)
+        nan_b = raw_text.loc[domain == 1].isna().mean(axis=0)
+        text_nan_table = pd.DataFrame({
+            "feature": text_cols,
+            "nan_rate_A": nan_a.values.round(4),
+            "nan_rate_B": nan_b.values.round(4),
+            "delta": (nan_b.values - nan_a.values).round(4),
+        })
+        groups["text_feats"] = raw_text.fillna(0.0).to_numpy(dtype=np.float32)
+        nan_rates["text_feats_per_feature"] = text_nan_table
+    # WavLM/Whisper group-level NaN rate (per-row: any NaN in the row?)
+    for layer in WAVLM_LAYERS:
+        arr_full = wavlm_by_layer_aug[(layer, "orig")][keep_idx]
+        any_nan = np.isnan(arr_full).any(axis=1)
+        nan_rates[f"wavlm_{layer}"] = {
+            "nan_row_rate_A": float(any_nan[domain == 0].mean()),
+            "nan_row_rate_B": float(any_nan[domain == 1].mean()),
+        }
+    arr_full = whisper_by_aug["orig"][keep_idx]
+    any_nan = np.isnan(arr_full).any(axis=1)
+    nan_rates["whisper"] = {
+        "nan_row_rate_A": float(any_nan[domain == 0].mean()),
+        "nan_row_rate_B": float(any_nan[domain == 1].mean()),
+    }
 
     out = open(args.out, "w", encoding="utf-8")
     out.write("DOMAIN GAP DIAGNOSTIC\n")
     out.write(f"client A = {CLIENT_A}\n")
     out.write(f"client B = {CLIENT_B}\n")
     out.write(f"rows kept: {keep.sum()}  (A: {is_a.sum()}, B: {is_b.sum()})\n")
+
+    # === 0. NaN PRESENCE BY GROUP / CLIENT ===
+    # Differential NaN rate between clients is itself a domain-shift symptom:
+    # if client B can't have a feature computed but client A can, that's audio/
+    # transcript-quality drift.
+    out.write(fmt_header("0. NaN PRESENCE BY GROUP / CLIENT  "
+                         "(extraction failures; surfaces hidden drift)"))
+    out.write("Embedding-level (any NaN in row):\n")
+    emb_rows = []
+    for g in ("wavlm_last", "wavlm_9", "whisper"):
+        if g in nan_rates:
+            emb_rows.append({"group": g,
+                              "nan_row_rate_A": round(nan_rates[g]["nan_row_rate_A"], 4),
+                              "nan_row_rate_B": round(nan_rates[g]["nan_row_rate_B"], 4)})
+    out.write(pd.DataFrame(emb_rows).to_string(index=False))
+    out.write("\n\nText-feature-level (top-15 features by |Delta NaN rate|):\n")
+    if "text_feats_per_feature" in nan_rates:
+        t = nan_rates["text_feats_per_feature"].copy()
+        t["abs_delta"] = t["delta"].abs()
+        t = t.sort_values("abs_delta", ascending=False).drop(columns="abs_delta")
+        out.write(t.head(15).to_string(index=False))
+        out.write("\n\nTotal NaN cells in feat_* matrix:\n")
+        n_a_nan = int((t["nan_rate_A"] *
+                       int((domain == 0).sum())).sum())
+        n_b_nan = int((t["nan_rate_B"] *
+                       int((domain == 1).sum())).sum())
+        out.write(f"  client A: ~{n_a_nan} NaN cells across all feat_* columns\n")
+        out.write(f"  client B: ~{n_b_nan} NaN cells across all feat_* columns\n")
+        out.write("\n>>> All NaN cells were filled with 0.0 below (matches training scripts).\n")
+        out.write(">>> If a feat_* has Delta NaN rate > 0.10, the feature is unreliable on\n")
+        out.write(">>> that client -- consider dropping it before training.\n")
+        out.write(">>> NaN at extraction = empty transcript, audio too short, or library\n")
+        out.write(">>> missing for that feature; full_text_features.py normally returns 0.0\n")
+        out.write(">>> but some corner cases leak through to gt.csv as NaN/string.\n")
+    else:
+        out.write("(no feat_* columns)\n")
 
     # === 1. LABEL PRIOR SHIFT ===
     out.write(fmt_header("1. LABEL PRIOR SHIFT  (per-client cheat rate)"))
