@@ -1,0 +1,165 @@
+================================================================================
+COMMANDS_CASUAL.txt -- casual_conversations + ALLSTAR self-test recipes
+================================================================================
+
+Casual Conversations is a public read-vs-spontaneous corpus:
+    scripted     -> label 1  (read-aloud = cheat-analog)
+    nonscripted  -> label 0  (spontaneous = genuine)
+    555 scripted + 1727 nonscripted English clips.
+
+Used as its OWN batch (batch='casual'), group_ids in the CC_NNNNN namespace.
+
+Paths assume:
+    repo     = ~/speech3
+    data dir = /home/ubuntu/nn/data
+    runs dir = /home/ubuntu/nn/runs
+Adjust if yours differ.
+
+--------------------------------------------------------------------------------
+0. PRE-FLIGHT
+--------------------------------------------------------------------------------
+
+cd ~/speech3 && git pull
+
+--------------------------------------------------------------------------------
+1. PREP  -- download casual_conversations.zip from HF, segment, transcribe,
+            compute 55 feat_* cols, append 'casual' rows to gt.csv
+--------------------------------------------------------------------------------
+
+# Smoke test first (10 clips) to confirm the pipeline runs end-to-end:
+python ec2/casual_conversations_prep.py --out_dir /home/ubuntu/nn/data --max_files 10
+
+# Full prep (all ~2282 clips; ~1-2h on GPU for whisper transcription):
+python ec2/casual_conversations_prep.py --out_dir /home/ubuntu/nn/data
+
+# Useful flags:
+#   --languages english        keep only english clips (default)
+#   --languages ""             keep all languages
+#   --segments_per_audio 2     segments per clip (default 2)
+#   --seg_min_sec 30 --seg_max_sec 60   segment length window
+#   --skip_download            reuse already-unzipped data under --download_dest
+#   --device auto              auto = cuda if available (recommended)
+
+--------------------------------------------------------------------------------
+2. EXTRACT EMBEDDINGS  -- incremental; picks up the new casual rows
+--------------------------------------------------------------------------------
+
+python ec2/extract_embeddings.py --data_dir /home/ubuntu/nn/data
+
+--------------------------------------------------------------------------------
+3. CASUAL SELF-TEST  -- can the model separate read vs spontaneous on this
+                        clean public corpus?  (Mode A KFold on 'casual' alone,
+                        speaker-disjoint via CC_NNNNN group_ids)
+--------------------------------------------------------------------------------
+
+# NN
+python ec2/neural_baseline_train_v2.py \
+    --data_dir /home/ubuntu/nn/data \
+    --out_dir  /home/ubuntu/nn/runs/casual_selftest \
+    --train_batches casual \
+    --train_only_batches "" \
+    --test_batches "" \
+    --min_duration 5.0 \
+    --use_text_features true \
+    --per_client_standardize false \
+    --drop_high_ks_features true \
+    --prior_correction false
+
+# XGB
+python ec2/xgboost_train_v2.py \
+    --data_dir /home/ubuntu/nn/data \
+    --out_dir  /home/ubuntu/nn/runs/casual_selftest \
+    --train_batches casual \
+    --train_only_batches "" \
+    --test_batches "" \
+    --min_duration 5.0 \
+    --use_text_features true \
+    --per_client_standardize false \
+    --drop_high_ks_features true \
+    --prior_correction false
+
+--------------------------------------------------------------------------------
+4. ALLSTAR SELF-TEST  -- same capability check on ALLSTAR (read vs spontaneous
+                         from task codes). No code change: drop 2676,2677 from
+                         --train_only_batches and put them in --train_batches.
+--------------------------------------------------------------------------------
+
+# NN
+python ec2/neural_baseline_train_v2.py \
+    --data_dir /home/ubuntu/nn/data \
+    --out_dir  /home/ubuntu/nn/runs/allstar_selftest \
+    --train_batches 2676,2677 \
+    --train_only_batches "" \
+    --test_batches "" \
+    --min_duration 5.0 \
+    --use_text_features true \
+    --per_client_standardize false \
+    --drop_high_ks_features true \
+    --prior_correction false
+
+# XGB
+python ec2/xgboost_train_v2.py \
+    --data_dir /home/ubuntu/nn/data \
+    --out_dir  /home/ubuntu/nn/runs/allstar_selftest \
+    --train_batches 2676,2677 \
+    --train_only_batches "" \
+    --test_batches "" \
+    --min_duration 5.0 \
+    --use_text_features true \
+    --per_client_standardize false \
+    --drop_high_ks_features true \
+    --prior_correction false
+
+--------------------------------------------------------------------------------
+5. COLLATE + ANALYZE  (full run name as recipe so each self-test is distinct)
+--------------------------------------------------------------------------------
+
+python -c "
+import glob, os, pandas as pd
+frames = []
+for f in sorted(glob.glob('/home/ubuntu/nn/runs/*/summary*.csv')):
+    run = os.path.basename(os.path.dirname(f))
+    df = pd.read_csv(f)
+    df['run']    = run
+    df['head']   = 'nn' if f.endswith('summary1.csv') else 'xgb'
+    df['recipe'] = run
+    frames.append(df)
+out = pd.concat(frames, ignore_index=True)
+out.to_excel('/home/ubuntu/nn/runs/collated_v3.xlsx', index=False)
+print('wrote', len(out), 'rows ; recipes:', sorted(out['recipe'].unique()))
+"
+
+python analyze_collated_results.py \
+    --in  /home/ubuntu/nn/runs/collated_v3.xlsx \
+    --out /home/ubuntu/nn/runs/report_v3.txt \
+    --axes head,recipe \
+    --top_n 10 \
+    --primary_metric test_best_f1 \
+    --baseline_recipe casual_selftest
+
+--------------------------------------------------------------------------------
+HOW TO READ THE RESULT
+--------------------------------------------------------------------------------
+
+* casual_selftest F1 = ceiling of read-vs-spontaneous separability on clean
+  public data. If this is high (>0.9) but audios6 is ~0.76, the gap is the
+  CLIENT being hard, not the task being hard.
+
+* allstar_selftest F1 = same ceiling on a different public corpus. Compare to
+  casual_selftest: if both high, the approach is sound and the audios6 gap is
+  purely domain shift (which the v2 work targets).
+
+* These two are CAPABILITY checks, run once. For the deployment iteration loop
+  (closing the audios6 gap), keep casual + ALLSTAR as --train_only_batches and
+  keep testing on audios6. Don't fold them into the deployment eval -- it
+  blends "public-corpus performance" with "client performance" and muddies the
+  domain-gap analysis.
+
+--------------------------------------------------------------------------------
+PII NOTE
+--------------------------------------------------------------------------------
+
+Casual Conversations and ALLSTAR are PUBLIC corpora -- safe to process and
+transcribe on EC2. casual_transcripts.json / allstar_transcripts.json are
+transcripts of public audio, NOT PII-gated. (mercer-mettl transcripts remain
+laptop-only.) gt.csv stays anonymized via the CC_/AS_/G_ namespaces.
