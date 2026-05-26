@@ -150,7 +150,8 @@ from sklearn.metrics import f1_score
 from sklearn.preprocessing import StandardScaler
 from torch.utils.data import DataLoader, TensorDataset
 
-from _data_pipeline import (WAVLM_LAYERS, assert_no_group_leak, build_splits,
+from _data_pipeline import (WAVLM_LAYERS, resolve_wavlm_layers,
+                            assert_no_group_leak, build_splits,
                             compute_metrics, extract_region_metrics,
                             load_cache_reindexed, load_gt_and_filter,
                             log_split_breakdown, log_variant_prelude,
@@ -414,6 +415,11 @@ def main() -> int:
     ap.add_argument("--out_dir", required=True)
     ap.add_argument("--cache", default="",
                     help="path to embeddings_cache.npz. Defaults to <data_dir>/embeddings_cache.npz.")
+    ap.add_argument("--wavlm_layers", default="",
+                    help="WavLM layer tags to use. Empty (default) = whatever "
+                         "the cache was built with (auto-detected). For large "
+                         "models extracted with only 'last', this resolves to "
+                         "['last'] automatically. Override e.g. 'last' or 'last,9'.")
     ap.add_argument("--train_batches", default="audios2,audios4,audios5,audios6,2676,2677")
     ap.add_argument("--test_batches", default="",
                     help="empty -> 60/20/20 candidate-wise split on train_batches")
@@ -492,6 +498,12 @@ def main() -> int:
     log.info("data_dir = %s", data_dir)
     log.info("out_dir  = %s", out_dir)
     log.info("cache    = %s", cache_path)
+
+    # Resolve WavLM layers from the cache (or --wavlm_layers override) and make
+    # it the module-wide setting used by make_variants / loaders below.
+    global WAVLM_LAYERS
+    WAVLM_LAYERS = resolve_wavlm_layers(cache_path, args.wavlm_layers, log)
+
     log.info("use_text_features      = %s", use_text_features)
     log.info("per_client_standardize = %s", do_per_client_std)
     log.info("fewshot_frac           = %.2f", args.fewshot_frac)

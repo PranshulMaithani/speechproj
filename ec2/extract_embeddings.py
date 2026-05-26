@@ -23,11 +23,24 @@ Augmentations:
     bgnoise (optional) AddBackgroundNoise    -- needs --noise_dir
     codec   (optional) Mp3Compression 32-64 kbps  -- if installed
 
-Run:
+Run (base models, default):
     python extract_embeddings.py \
         --data_dir /path/to/upload \
         --out_path /path/to/embeddings_cache.npz \
         --augs orig,noise,pitch,speed,gain,air,vtlp,combo
+
+Run (LARGE models -- use a SEPARATE out_path so caches don't mix):
+    python extract_embeddings.py \
+        --data_dir /path/to/upload \
+        --out_path /path/to/embeddings_cache_large.npz \
+        --wavlm_id microsoft/wavlm-large \
+        --whisper_id openai/whisper-large-v3 \
+        --augs orig
+
+Model dims are read from each model's config, so any HF WavLM / Whisper
+checkpoint works. The cache stamps the model IDs it was built with; if you
+point the same out_path at different model IDs the script refuses to reuse it
+(prevents mixing 768-d base with 1024-d large embeddings).
 """
 
 from __future__ import annotations
@@ -45,13 +58,11 @@ import torch
 from tqdm import tqdm
 from transformers import (WavLMModel, WhisperFeatureExtractor, WhisperModel)
 
-WAVLM_ID = "microsoft/wavlm-base-plus"
-WHISPER_ID = "openai/whisper-medium"
+WAVLM_ID_DEFAULT = "microsoft/wavlm-base-plus"
+WHISPER_ID_DEFAULT = "openai/whisper-medium"
 WAVLM_CHUNK_SEC = 20.0
 WHISPER_CHUNK_SEC = 30.0
 TARGET_SR = 16000
-WAVLM_DIM = 768
-WHISPER_DIM = 1024
 
 
 # ----------------------------------------------------------------------------
@@ -231,11 +242,14 @@ def load_cache(path: Path) -> dict | None:
 def save_cache(path: Path, filenames: np.ndarray, aug_names: list[str],
                wavlm_layers: list[str],
                wavlm: dict[tuple[str, str], np.ndarray],
-               whisper: dict[str, np.ndarray]) -> None:
+               whisper: dict[str, np.ndarray],
+               wavlm_id: str, whisper_id: str) -> None:
     out: dict[str, np.ndarray] = {
         "filenames": filenames,
         "aug_names": np.array(aug_names, dtype=object),
         "wavlm_layers": np.array(wavlm_layers, dtype=object),
+        "wavlm_id": np.array(wavlm_id, dtype=object),
+        "whisper_id": np.array(whisper_id, dtype=object),
     }
     for layer in wavlm_layers:
         for a in aug_names:
@@ -270,7 +284,16 @@ def main() -> int:
     ap.add_argument("--data_dir", required=True,
                     help="folder containing gt.csv and audio_npy/")
     ap.add_argument("--out_path", required=True,
-                    help="path to write embeddings_cache.npz")
+                    help="path to write embeddings_cache.npz. Use a DIFFERENT "
+                         "path per (wavlm_id, whisper_id) pair -- caches do not mix.")
+    ap.add_argument("--wavlm_id", default=WAVLM_ID_DEFAULT,
+                    help="HF WavLM checkpoint. base-plus=768d (default); "
+                         "microsoft/wavlm-large=1024d (24 layers).")
+    ap.add_argument("--whisper_id", default=WHISPER_ID_DEFAULT,
+                    help="HF Whisper checkpoint (encoder used). medium=1024d "
+                         "(default); openai/whisper-large-v3=1280d. NOTE: "
+                         "whisper-large-v3-turbo shares the large-v3 encoder, so "
+                         "for encoder embeddings use large-v3, not turbo.")
     ap.add_argument("--augs",
                     default="orig,noise,pitch,speed,gain,air,vtlp,combo",
                     help="comma-separated aug names; 'orig' is always included")
@@ -308,6 +331,21 @@ def main() -> int:
     layers = [l for l in layers if not (l in seen or seen.add(l))]
     log.info("wavlm_layers = %s", layers)
 
+    # Read model dims from config (no weights loaded) so any checkpoint works.
+    from transformers import AutoConfig
+    wavlm_cfg = AutoConfig.from_pretrained(args.wavlm_id)
+    whisper_cfg = AutoConfig.from_pretrained(args.whisper_id)
+    wavlm_dim = int(wavlm_cfg.hidden_size)
+    whisper_dim = int(whisper_cfg.d_model)
+    n_wavlm_layers = int(getattr(wavlm_cfg, "num_hidden_layers", 12))
+    log.info("wavlm_id=%s (dim=%d, %d layers)  whisper_id=%s (dim=%d)",
+             args.wavlm_id, wavlm_dim, n_wavlm_layers, args.whisper_id, whisper_dim)
+    bad_layers = [l for l in layers if l != "last" and not (0 <= int(l) <= n_wavlm_layers)]
+    if bad_layers:
+        log.error("wavlm layers out of range for this model (valid: last, 0..%d): %s",
+                  n_wavlm_layers, bad_layers)
+        return 2
+
     gt = pd.read_csv(data_dir / "gt.csv")
     filenames_cur = gt["npy_filename"].to_numpy().astype(str)
     log.info("gt rows = %d", len(filenames_cur))
@@ -320,6 +358,21 @@ def main() -> int:
     log.info("aug_names (after availability check) = %s", aug_names)
 
     cache = None if args.force else load_cache(out_path)
+
+    # Refuse to reuse a cache built with different model IDs (dims would mismatch).
+    if cache is not None:
+        cached_wavlm_id = str(cache["wavlm_id"]) if "wavlm_id" in cache else "(unknown/legacy)"
+        cached_whisper_id = str(cache["whisper_id"]) if "whisper_id" in cache else "(unknown/legacy)"
+        if cached_wavlm_id != args.wavlm_id or cached_whisper_id != args.whisper_id:
+            log.error(
+                "EXISTING CACHE AT %s WAS BUILT WITH DIFFERENT MODELS:\n"
+                "  cached : wavlm=%s  whisper=%s\n"
+                "  asked  : wavlm=%s  whisper=%s\n"
+                "Refusing to mix. Use a different --out_path for the new models, "
+                "or pass --force to overwrite this cache from scratch.",
+                out_path, cached_wavlm_id, cached_whisper_id,
+                args.wavlm_id, args.whisper_id)
+            return 3
 
     # wavlm_data keyed by (layer, aug); whisper_data keyed by aug.
     wavlm_data: dict[tuple[str, str], np.ndarray] = {}
@@ -348,7 +401,7 @@ def main() -> int:
 
         for layer in layers:
             for a in aug_names:
-                wavlm_data[(layer, a)] = np.zeros((len(filenames_cur), WAVLM_DIM),
+                wavlm_data[(layer, a)] = np.zeros((len(filenames_cur), wavlm_dim),
                                                   dtype=np.float32)
                 key = f"wavlm_{layer}_{a}"
                 if layer in cached_layers and a in cached_augs and key in cache:
@@ -358,7 +411,7 @@ def main() -> int:
                             wavlm_data[(layer, a)][new_idx] = src[f2c[fn]]
 
         for a in aug_names:
-            whisper_data[a] = np.zeros((len(filenames_cur), WHISPER_DIM), dtype=np.float32)
+            whisper_data[a] = np.zeros((len(filenames_cur), whisper_dim), dtype=np.float32)
             key = f"whisper_{a}"
             if a in cached_augs and key in cache:
                 src = cache[key]
@@ -369,10 +422,10 @@ def main() -> int:
         log.info("no existing cache (or --force); cold extraction")
         for layer in layers:
             for a in aug_names:
-                wavlm_data[(layer, a)] = np.zeros((len(filenames_cur), WAVLM_DIM),
+                wavlm_data[(layer, a)] = np.zeros((len(filenames_cur), wavlm_dim),
                                                   dtype=np.float32)
         for a in aug_names:
-            whisper_data[a] = np.zeros((len(filenames_cur), WHISPER_DIM), dtype=np.float32)
+            whisper_data[a] = np.zeros((len(filenames_cur), whisper_dim), dtype=np.float32)
 
     # Per file, determine which augs need any encoder work. Then for each such
     # aug, figure out which wavlm layers + whisper still need extraction.
@@ -390,17 +443,18 @@ def main() -> int:
 
     log.info("files needing extraction = %d", len(by_file))
     if not by_file:
-        save_cache(out_path, filenames_cur, aug_names, layers, wavlm_data, whisper_data)
+        save_cache(out_path, filenames_cur, aug_names, layers, wavlm_data,
+                   whisper_data, args.wavlm_id, args.whisper_id)
         log.info("Cache up-to-date. Saved (possibly trimmed to current gt) to %s", out_path)
         return 0
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     log.info("device = %s", device)
-    log.info("Loading WavLM (%s)...", WAVLM_ID)
-    wavlm = WavLMModel.from_pretrained(WAVLM_ID).to(device).eval()
-    log.info("Loading Whisper (%s)...", WHISPER_ID)
-    whisper = WhisperModel.from_pretrained(WHISPER_ID).to(device).eval()
-    whisper_feat = WhisperFeatureExtractor.from_pretrained(WHISPER_ID)
+    log.info("Loading WavLM (%s)...", args.wavlm_id)
+    wavlm = WavLMModel.from_pretrained(args.wavlm_id).to(device).eval()
+    log.info("Loading Whisper (%s)...", args.whisper_id)
+    whisper = WhisperModel.from_pretrained(args.whisper_id).to(device).eval()
+    whisper_feat = WhisperFeatureExtractor.from_pretrained(args.whisper_id)
 
     npy_dir = data_dir / "audio_npy"
     fn_to_row = {fn: i for i, fn in enumerate(filenames_cur)}
@@ -436,7 +490,8 @@ def main() -> int:
                     wav_a, whisper, whisper_feat, device)
 
     log.info("extraction done in %.1f s", time.time() - t0)
-    save_cache(out_path, filenames_cur, aug_names, layers, wavlm_data, whisper_data)
+    save_cache(out_path, filenames_cur, aug_names, layers, wavlm_data,
+               whisper_data, args.wavlm_id, args.whisper_id)
     log.info("Saved cache to %s  (filenames=%d, augs=%d, layers=%d)",
              out_path, len(filenames_cur), len(aug_names), len(layers))
 

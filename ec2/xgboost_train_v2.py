@@ -115,7 +115,8 @@ import numpy as np
 import pandas as pd
 import xgboost as xgb
 
-from _data_pipeline import (WAVLM_LAYERS, assert_no_group_leak, build_splits,
+from _data_pipeline import (WAVLM_LAYERS, resolve_wavlm_layers,
+                            assert_no_group_leak, build_splits,
                             compute_metrics, extract_region_metrics,
                             load_cache_reindexed, load_gt_and_filter,
                             log_split_breakdown, log_variant_prelude,
@@ -493,6 +494,11 @@ def main() -> int:
     ap.add_argument("--data_dir", required=True)
     ap.add_argument("--out_dir", required=True)
     ap.add_argument("--cache", default="")
+    ap.add_argument("--wavlm_layers", default="",
+                    help="WavLM layer tags to use. Empty (default) = whatever "
+                         "the cache was built with (auto-detected). Large caches "
+                         "extracted with only 'last' resolve to ['last']. "
+                         "Override e.g. 'last' or 'last,9'.")
     ap.add_argument("--train_batches", default="audios2,audios4,audios5,audios6,2676,2677")
     ap.add_argument("--test_batches", default="")
     ap.add_argument("--test_region_filter", default="")
@@ -547,6 +553,12 @@ def main() -> int:
     log.info("data_dir = %s", data_dir)
     log.info("out_dir  = %s", out_dir)
     log.info("cache    = %s", cache_path)
+
+    # Resolve WavLM layers from the cache (or --wavlm_layers override) and make
+    # it the module-wide setting used by expand_variants / loaders below.
+    global WAVLM_LAYERS
+    WAVLM_LAYERS = resolve_wavlm_layers(cache_path, args.wavlm_layers, log)
+
     log.info("use_text_features      = %s", use_text_features)
     log.info("per_client_standardize = %s", do_per_client_std)
     log.info("fewshot_frac           = %.2f", args.fewshot_frac)

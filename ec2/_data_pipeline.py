@@ -451,6 +451,47 @@ def resolve_use_augs(use_augs_arg: str, cache_path: Path,
     return wanted
 
 
+def resolve_wavlm_layers(cache_path: Path, override: str,
+                         log: logging.Logger) -> list[str]:
+    """Decide which WavLM layer tags training should use.
+
+    override empty  -> read the layers the cache was actually built with
+                       (the 'wavlm_layers' key stamped by extract_embeddings.py).
+                       Large-model caches extracted with only 'last' are thus
+                       auto-detected -- no need to remember a flag.
+    override set    -> use exactly those (must be a subset of what's in cache).
+
+    'last' is always forced in and order is de-duplicated. Falls back to
+    ['last'] for legacy caches with no 'wavlm_layers' key."""
+    s = override.strip()
+    if s:
+        layers = [l.strip() for l in s.split(",") if l.strip()]
+        # validate against cache when possible
+        if cache_path.exists():
+            cache = np.load(cache_path, allow_pickle=True)
+            if "wavlm_layers" in cache:
+                have = set(cache["wavlm_layers"].astype(str))
+                missing = [l for l in layers if l not in have]
+                if missing:
+                    raise ValueError(
+                        f"--wavlm_layers requested {missing} but cache has "
+                        f"{sorted(have)}. Re-extract with those layers.")
+    else:
+        if cache_path.exists():
+            cache = np.load(cache_path, allow_pickle=True)
+            layers = (list(cache["wavlm_layers"].astype(str))
+                      if "wavlm_layers" in cache else ["last"])
+        else:
+            layers = ["last"]
+    layers = [str(l) for l in layers]  # plain str (avoid np.str_ in JSON/keys)
+    if "last" not in layers:
+        layers = ["last"] + layers
+    seen: set[str] = set()
+    layers = [l for l in layers if not (l in seen or seen.add(l))]
+    log.info("resolved wavlm_layers = %s  (override=%r)", layers, override)
+    return layers
+
+
 # ----------------------------------------------------------------------------
 # Metrics.
 # ----------------------------------------------------------------------------

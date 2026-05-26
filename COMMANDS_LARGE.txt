@@ -1,0 +1,190 @@
+================================================================================
+COMMANDS_LARGE.txt -- try larger WavLM + Whisper encoders
+================================================================================
+
+Goal: see whether bigger encoders beat base on the audios6 gap.
+
+Models:
+    WavLM-large       microsoft/wavlm-large       1024-d, 24 layers
+    Whisper-large-v3  openai/whisper-large-v3      1280-d encoder
+(base was wavlm-base-plus 768d + whisper-medium 1024d)
+
+The large embeddings go in a SEPARATE cache file. extract_embeddings.py stamps
+the model IDs into the cache and refuses to mix base + large, so you can't
+corrupt the existing cache by accident.
+
+Paths assume:
+    repo     = ~/speech3
+    data dir = /home/ubuntu/nn/data
+    runs dir = /home/ubuntu/nn/runs
+
+--------------------------------------------------------------------------------
+0. PRE-FLIGHT
+--------------------------------------------------------------------------------
+
+cd ~/speech3 && git pull
+
+--------------------------------------------------------------------------------
+1. EXTRACT LARGE EMBEDDINGS  (separate cache; orig only; LAST LAYER ONLY)
+   SLOW: whisper-large-v3 + wavlm-large over the whole gt.csv ~ a few hours
+   on GPU. We extract ONLY the last WavLM layer for large -- layer 9 of 24 is
+   too early to be meaningful, and last-only halves the extraction + variants.
+   The training scripts AUTO-DETECT the cache's layers, so you don't pass
+   --wavlm_layers at train time.
+--------------------------------------------------------------------------------
+
+python ec2/extract_embeddings.py \
+    --data_dir /home/ubuntu/nn/data \
+    --out_path /home/ubuntu/nn/data/embeddings_cache_large.npz \
+    --wavlm_id microsoft/wavlm-large \
+    --whisper_id openai/whisper-large-v3 \
+    --wavlm_layers last \
+    --augs orig \
+    2>&1 | tee /home/ubuntu/nn/runs/extract_large.txt
+
+--------------------------------------------------------------------------------
+2. TRAIN ON LARGE CACHE  (same R6 recipe; --cache points at the large file)
+   Each run is teed to its own results txt; the SUMMARY table is at the bottom.
+--------------------------------------------------------------------------------
+
+# NN
+python ec2/neural_baseline_train_v2.py \
+    --data_dir /home/ubuntu/nn/data \
+    --cache    /home/ubuntu/nn/data/embeddings_cache_large.npz \
+    --out_dir  /home/ubuntu/nn/runs/r6_large \
+    --train_batches audios2,audios4,audios5,audios6 \
+    --train_only_batches "" \
+    --test_batches  audios6 \
+    --test_region_filter IND \
+    --min_duration 5.0 \
+    --use_text_features true \
+    --per_client_standardize false \
+    --fewshot_frac 0.10 \
+    --drop_high_ks_features true \
+    --prior_correction true \
+    --target_prior -1.0 \
+    --use_augs "" \
+    2>&1 | tee /home/ubuntu/nn/runs/r6_large_nn.txt
+
+# XGB
+python ec2/xgboost_train_v2.py \
+    --data_dir /home/ubuntu/nn/data \
+    --cache    /home/ubuntu/nn/data/embeddings_cache_large.npz \
+    --out_dir  /home/ubuntu/nn/runs/r6_large \
+    --train_batches audios2,audios4,audios5,audios6 \
+    --train_only_batches "" \
+    --test_batches  audios6 \
+    --test_region_filter IND \
+    --min_duration 5.0 \
+    --use_text_features true \
+    --per_client_standardize false \
+    --fewshot_frac 0.10 \
+    --drop_high_ks_features true \
+    --prior_correction true \
+    --target_prior -1.0 \
+    --use_augs "" \
+    2>&1 | tee /home/ubuntu/nn/runs/r6_large_xgb.txt
+
+--------------------------------------------------------------------------------
+3. (FOR A FAIR BASE-vs-LARGE COMPARISON) re-run the SAME recipe on the BASE
+   cache into r6_base, if you don't already have an equivalent run.
+--------------------------------------------------------------------------------
+
+# NN  (base cache = default embeddings_cache.npz)
+python ec2/neural_baseline_train_v2.py \
+    --data_dir /home/ubuntu/nn/data \
+    --cache    /home/ubuntu/nn/data/embeddings_cache.npz \
+    --out_dir  /home/ubuntu/nn/runs/r6_base \
+    --train_batches audios2,audios4,audios5,audios6 \
+    --train_only_batches "" \
+    --test_batches  audios6 \
+    --test_region_filter IND \
+    --min_duration 5.0 \
+    --use_text_features true \
+    --per_client_standardize false \
+    --fewshot_frac 0.10 \
+    --drop_high_ks_features true \
+    --prior_correction true \
+    --target_prior -1.0 \
+    --use_augs "" \
+    2>&1 | tee /home/ubuntu/nn/runs/r6_base_nn.txt
+
+# XGB (base)
+python ec2/xgboost_train_v2.py \
+    --data_dir /home/ubuntu/nn/data \
+    --cache    /home/ubuntu/nn/data/embeddings_cache.npz \
+    --out_dir  /home/ubuntu/nn/runs/r6_base \
+    --train_batches audios2,audios4,audios5,audios6 \
+    --train_only_batches "" \
+    --test_batches  audios6 \
+    --test_region_filter IND \
+    --min_duration 5.0 \
+    --use_text_features true \
+    --per_client_standardize false \
+    --fewshot_frac 0.10 \
+    --drop_high_ks_features true \
+    --prior_correction true \
+    --target_prior -1.0 \
+    --use_augs "" \
+    2>&1 | tee /home/ubuntu/nn/runs/r6_base_xgb.txt
+
+--------------------------------------------------------------------------------
+4. COLLATE + ANALYZE  (r6_base vs r6_large -> the answer to "do big models help")
+--------------------------------------------------------------------------------
+
+python -c "
+import glob, os, pandas as pd
+frames = []
+for f in sorted(glob.glob('/home/ubuntu/nn/runs/*/summary*.csv')):
+    run = os.path.basename(os.path.dirname(f))
+    df = pd.read_csv(f)
+    df['run']    = run
+    df['head']   = 'nn' if f.endswith('summary1.csv') else 'xgb'
+    df['recipe'] = run
+    frames.append(df)
+out = pd.concat(frames, ignore_index=True)
+out.to_excel('/home/ubuntu/nn/runs/collated_large.xlsx', index=False)
+print('wrote', len(out), 'rows ; recipes:', sorted(out['recipe'].unique()))
+"
+
+python analyze_collated_results.py \
+    --in  /home/ubuntu/nn/runs/collated_large.xlsx \
+    --out /home/ubuntu/nn/runs/report_large.txt \
+    --axes head,recipe \
+    --top_n 10 \
+    --primary_metric test_best_f1 \
+    --baseline_recipe r6_base
+
+--------------------------------------------------------------------------------
+WHERE THE RESULTS ARE
+--------------------------------------------------------------------------------
+
+  /home/ubuntu/nn/runs/extract_large.txt      extraction log (timings, dims)
+  /home/ubuntu/nn/runs/r6_large_nn.txt        NN run log + SUMMARY table at end
+  /home/ubuntu/nn/runs/r6_large_xgb.txt       XGB run log + SUMMARY table at end
+  /home/ubuntu/nn/runs/r6_large/summary1.csv  NN structured results
+  /home/ubuntu/nn/runs/r6_large/summary2.csv  XGB structured results
+  /home/ubuntu/nn/runs/report_large.txt       base-vs-large comparison report
+
+Paste back report_large.txt section 14 (DELTA r6_large vs r6_base) and 16.
+
+--------------------------------------------------------------------------------
+NOTES
+--------------------------------------------------------------------------------
+
+* whisper-large-v3-turbo shares the large-v3 ENCODER, so for encoder
+  embeddings use large-v3 (turbo gives identical encoder output, no benefit).
+
+* Layers are AUTO-DETECTED at train time from the cache's stamped wavlm_layers.
+  The large cache has only 'last', so training uses last-only automatically.
+  To experiment with a deeper layer instead: re-extract with e.g.
+  --wavlm_layers last,18, then training auto-picks up both. (You can also
+  force a subset at train time with --wavlm_layers last.)
+
+* If you OOM on extraction: whisper-large-v3 is the heavier model. Drop to
+  --whisper_id openai/whisper-large-v3 only on a GPU with >=10GB, or keep
+  whisper-medium and only upgrade wavlm:
+      --wavlm_id microsoft/wavlm-large --whisper_id openai/whisper-medium
+
+* The large cache is a separate file; the base cache is untouched. Switch
+  between them purely via --cache on the training scripts.
