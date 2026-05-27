@@ -295,6 +295,7 @@ class TrainResult:
     best_val_f1: float
     best_epoch: int
     test_metrics: dict
+    extra_pred: np.ndarray | None = None  # predictions on --dump_full_predictions matrix
 
 
 def train_one(X_tr, y_tr, X_va, y_va, X_te, y_te, *, in_dim: int, batch_size: int,
@@ -304,7 +305,8 @@ def train_one(X_tr, y_tr, X_va, y_va, X_te, y_te, *, in_dim: int, batch_size: in
               label_smoothing: float = LABEL_SMOOTHING,
               grad_clip: float = GRAD_CLIP_NORM,
               patience: int = 10,
-              class_balance: str = "sampler") -> tuple[TrainResult, np.ndarray]:
+              class_balance: str = "sampler",
+              extra_predict: np.ndarray | None = None) -> tuple[TrainResult, np.ndarray]:
     """class_balance:
         'sampler'    WeightedRandomSampler so each minibatch is class-balanced
                      in expectation (default; replaces pos_weight)
@@ -401,7 +403,8 @@ def train_one(X_tr, y_tr, X_va, y_va, X_te, y_te, *, in_dim: int, batch_size: in
 
     test_p = predict(X_te)
     metrics = compute_metrics(y_te, test_p)
-    return TrainResult(best_val_f1, best_epoch, metrics), test_p
+    extra_p = predict(extra_predict) if extra_predict is not None else None
+    return TrainResult(best_val_f1, best_epoch, metrics, extra_pred=extra_p), test_p
 
 
 # ----------------------------------------------------------------------------
@@ -469,6 +472,14 @@ def main() -> int:
                          "(estimate from test labels; oracle, research only). "
                          "For deployment supply the new client's known cheat "
                          "rate, e.g. 0.12 for audios6.")
+    ap.add_argument("--dump_full_predictions", default="false",
+                    choices=["true", "false"],
+                    help="V2: for every variant, predict on ALL rows (train+val"
+                         "+test, orig embeddings) using the trained model and "
+                         "write full_pred_<variant>.csv (npy_filename, group_id, "
+                         "batch, region, label, split, pred_prob). Used by "
+                         "build_analysis_excel.py. Reuses the exact trained "
+                         "model so numbers match the normal run.")
     ap.add_argument("--batch_size", type=int, default=64)
     ap.add_argument("--epochs", type=int, default=60)
     ap.add_argument("--lr", type=float, default=1e-3)
@@ -484,6 +495,7 @@ def main() -> int:
 
     use_text_features = (args.use_text_features == "true")
     do_per_client_std = (args.per_client_standardize == "true")
+    dump_full = (args.dump_full_predictions == "true")
     train_batches = [b.strip() for b in args.train_batches.split(",") if b.strip()]
     test_batches = [b.strip() for b in args.test_batches.split(",") if b.strip()]
     train_only_batches = [b.strip() for b in args.train_only_batches.split(",") if b.strip()]
@@ -590,6 +602,11 @@ def main() -> int:
     train_idx = splits["train"]
     val_idx = splits["val"]
     test_idx = splits["test"]
+    # Per-row split label for the full-prediction dump (train/val/test/unused).
+    split_label = np.array(["unused"] * len(gt), dtype=object)
+    split_label[train_idx] = "train"
+    split_label[val_idx] = "val"
+    split_label[test_idx] = "test"
     feat_train = feat_arr[train_idx] if feat_arr is not None else None
     y_train_base = y_full[train_idx]
     y_val = y_full[val_idx]
@@ -636,6 +653,10 @@ def main() -> int:
             "X_val_s": X_val_s, "X_test_s": X_test_s,
             "aug_tags": aug_tags,
         }
+        # For --dump_full_predictions: ALL rows, orig embeddings only, through
+        # the SAME scaler (so train-row predictions are consistent with val/test).
+        if dump_full:
+            per_layer[layer]["X_all_s"] = scaler.transform(X_orig).astype(np.float32)
 
     # ---- Iterate variants (20 = 2 archs x 2 wavlm layers x 5 PCAs) ----
     summary_rows: list[dict] = []
@@ -657,6 +678,7 @@ def main() -> int:
         if pca_var is None:
             Xt, Xv, Xs = X_train_s, X_val_s, X_test_s
             in_dim = Xt.shape[1]
+            X_all = lp["X_all_s"] if dump_full else None
         else:
             pca = PCA(n_components=pca_var, svd_solver="full", random_state=args.seed)
             pca.fit(X_train_s)
@@ -665,13 +687,16 @@ def main() -> int:
             Xs = pca.transform(X_test_s).astype(np.float32)
             in_dim = Xt.shape[1]
             log.info("PCA(%.2f) -> %d components", pca_var, in_dim)
+            X_all = (pca.transform(lp["X_all_s"]).astype(np.float32)
+                     if dump_full else None)
 
         result, test_p = train_one(
             Xt, y_train, Xv, y_val, Xs, y_test,
             in_dim=in_dim, batch_size=args.batch_size, epochs=args.epochs,
             lr=args.lr, wd=arch["weight_decay"], device=device, log=log, tag=variant,
             hidden=tuple(arch["hidden"]), dropout=arch["dropout"],
-            class_balance=args.class_balance)
+            class_balance=args.class_balance,
+            extra_predict=X_all)
 
         # ---- v2: prior correction. Recompute test metrics on corrected scores.
         # Monotonic, so best_f1/AUC/AP unchanged; what changes is calibration
@@ -691,6 +716,30 @@ def main() -> int:
         pred_df = gt.iloc[test_idx].copy()
         pred_df["pred_score"] = test_p
         pred_df.to_csv(var_dir / "predictions.csv", index=False)
+
+        # ---- v2: full-data prediction dump (train+val+test, orig embeddings).
+        # Same trained model -> test rows here equal predictions.csv exactly.
+        if dump_full and result.extra_pred is not None:
+            full_p = result.extra_pred
+            if _str_to_bool(args.prior_correction):
+                full_p = apply_prior_correction(full_p, pi_train, pi_target)
+            full_df = pd.DataFrame({
+                "npy_filename": filenames_cur,
+                "group_id": (gt["group_id"].astype(str).to_numpy()
+                             if "group_id" in gt.columns else ""),
+                "question_id": (gt["question_id"].astype(str).to_numpy()
+                                if "question_id" in gt.columns else ""),
+                "batch": gt["batch"].astype(str).to_numpy(),
+                "region": (gt["region"].astype(str).to_numpy()
+                           if "region" in gt.columns else ""),
+                "label": y_full,
+                "split": split_label,
+                "pred_prob": full_p,
+            })
+            full_df.to_csv(var_dir / "full_predictions.csv", index=False)
+            log.info("[%s] wrote full_predictions.csv (%d rows: %s)",
+                     variant, len(full_df),
+                     full_df["split"].value_counts().to_dict())
 
         m = result.test_metrics
         log.info("[%s] TEST n=%d  auc=%.3f  ap=%.3f  thr0.5 f1=%.3f  best_f1=%.3f@%.2f",

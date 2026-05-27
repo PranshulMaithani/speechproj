@@ -1,0 +1,160 @@
+================================================================================
+COMMANDS_ANALYSIS.txt -- 2-model full analysis workbook (6 sheets)
+================================================================================
+
+Uses ec2/neural_baseline_train.py (v1 -- the script your finalised runs were
+made with). v1 has no --drop_high_ks_features / --prior_correction / --wavlm_layers
+flags, so the commands are the plain config.
+
+Two finalised models (from the spec table):
+  Model 1:  nn  default_last_pca98  text=yes  aug=all  + casual dataset
+  Model 2:  nn  tiny_l9_pca95       text=yes  aug=all  (no extra dataset)
+
+Each evaluated under BOTH split protocols:
+  20% split : Mode A, 60/20/20 candidate-wise on audios2/4/5/6
+  a6 split  : Mode B, test = ALL of audios6 (no region filter), train = audios2/4/5
+
+min_duration = 30s on all runs (rows shorter than 30s are dropped).
+
+=> 4 training runs (2 data configs x 2 splits), all with
+   --dump_full_predictions true. Each run dumps full_predictions.csv per variant
+   (predict on ALL rows with the exact trained model -> test rows reproduce the
+   original numbers). Then build_analysis_excel.py assembles the 6 sheets.
+
+Uses the BASE cache (embeddings_cache.npz) because aug=all needs the augmented
+embeddings (noise/pitch/speed/...). Independent of the large-model extraction.
+
+Paths assume repo=~/speech3, data=/home/ubuntu/nn/data, runs=/home/ubuntu/nn/runs.
+
+--------------------------------------------------------------------------------
+0. PRE-FLIGHT
+--------------------------------------------------------------------------------
+
+cd ~/speech3 && git pull
+pip install openpyxl          # needed to write the .xlsx (one-time)
+
+--------------------------------------------------------------------------------
+CONFIG (matches your finalised runs)
+--------------------------------------------------------------------------------
+* casual is on MODEL 1 ONLY, as train-only aux (--train_only_batches casual);
+  never in mercer val/test. Model 2 uses --train_only_batches "" (no casual).
+  => 4 distinct runs (model1 has different training data than model2).
+* min_duration 30 on ALL runs.
+* a6 split has NO region filter -> every audios6 row is in the a6 test set
+  (both IND and PHP). split_a6_test is train/val/test (no 'unused').
+* --use_augs all, --use_text_features true, --seed 42, --class_balance sampler
+  are v1 defaults; keep identical across all 4 runs so probs match your originals.
+
+--------------------------------------------------------------------------------
+1. MODEL 1 (casual) -- 20% split
+--------------------------------------------------------------------------------
+python ec2/neural_baseline_train.py \
+    --data_dir /home/ubuntu/nn/data \
+    --cache    /home/ubuntu/nn/data/embeddings_cache.npz \
+    --out_dir  /home/ubuntu/nn/runs/m1_casual_20pct \
+    --train_batches audios2,audios4,audios5,audios6 \
+    --train_only_batches casual \
+    --test_batches "" \
+    --min_duration 30 \
+    --use_text_features true \
+    --use_augs all \
+    --per_client_standardize false \
+    --dump_full_predictions true
+
+--------------------------------------------------------------------------------
+2. MODEL 1 (casual) -- a6 split
+--------------------------------------------------------------------------------
+python ec2/neural_baseline_train.py \
+    --data_dir /home/ubuntu/nn/data \
+    --cache    /home/ubuntu/nn/data/embeddings_cache.npz \
+    --out_dir  /home/ubuntu/nn/runs/m1_casual_a6 \
+    --train_batches audios2,audios4,audios5,audios6 \
+    --train_only_batches casual \
+    --test_batches audios6 \
+    --min_duration 30 \
+    --use_text_features true \
+    --use_augs all \
+    --per_client_standardize false \
+    --dump_full_predictions true
+
+--------------------------------------------------------------------------------
+3. MODEL 2 (no casual) -- 20% split
+--------------------------------------------------------------------------------
+python ec2/neural_baseline_train.py \
+    --data_dir /home/ubuntu/nn/data \
+    --cache    /home/ubuntu/nn/data/embeddings_cache.npz \
+    --out_dir  /home/ubuntu/nn/runs/m2_nocasual_20pct \
+    --train_batches audios2,audios4,audios5,audios6 \
+    --train_only_batches "" \
+    --test_batches "" \
+    --min_duration 30 \
+    --use_text_features true \
+    --use_augs all \
+    --per_client_standardize false \
+    --dump_full_predictions true
+
+--------------------------------------------------------------------------------
+4. MODEL 2 (no casual) -- a6 split
+--------------------------------------------------------------------------------
+python ec2/neural_baseline_train.py \
+    --data_dir /home/ubuntu/nn/data \
+    --cache    /home/ubuntu/nn/data/embeddings_cache.npz \
+    --out_dir  /home/ubuntu/nn/runs/m2_nocasual_a6 \
+    --train_batches audios2,audios4,audios5,audios6 \
+    --train_only_batches "" \
+    --test_batches audios6 \
+    --min_duration 30 \
+    --use_text_features true \
+    --use_augs all \
+    --per_client_standardize false \
+    --dump_full_predictions true
+
+--------------------------------------------------------------------------------
+5. BUILD THE WORKBOOK  (reads full_predictions.csv from the 4 runs)
+--------------------------------------------------------------------------------
+python ec2/build_analysis_excel.py \
+    --model1_variant default_last_pca98 \
+    --model1_label   m1_default_last_pca98_casual \
+    --model1_20pct_run /home/ubuntu/nn/runs/m1_casual_20pct \
+    --model1_a6_run    /home/ubuntu/nn/runs/m1_casual_a6 \
+    --model2_variant tiny_l9_pca95 \
+    --model2_label   m2_tiny_l9_pca95 \
+    --model2_20pct_run /home/ubuntu/nn/runs/m2_nocasual_20pct \
+    --model2_a6_run    /home/ubuntu/nn/runs/m2_nocasual_a6 \
+    --out /home/ubuntu/nn/runs/analysis_2models.xlsx
+
+--------------------------------------------------------------------------------
+RESULTING WORKBOOK  (6 sheets)
+--------------------------------------------------------------------------------
+  m1_default_last_pca98_casual_pred    per-file preds (all mercer rows)
+  m1_default_last_pca98_casual_sweep   threshold sweep, all rows
+  m1_default_last_pca98_casual_sweepT  threshold sweep, test rows only
+  m2_tiny_l9_pca95_pred / _sweep / _sweepT
+
+Sheet 1 columns:
+  Filename | real_id (blank for your VLOOKUP) | GT (yes/no) | audios_folder
+  (2/4/5/6) | split_20%_test (train/val/test) | Prediction_prob_20%_test |
+  split_a6_test (train/val/test) | Prediction_prob_a6_test
+
+Sweep columns:
+  threshold | a6_fp a6_fn a6_tp a6_tn a6_precision a6_recall |
+              split20_fp split20_fn split20_tp split20_tn
+              split20_precision split20_recall
+  (101 rows, threshold 0.00 -> 1.00 step 0.01)
+
+--------------------------------------------------------------------------------
+NOTES
+--------------------------------------------------------------------------------
+* test rows in full_predictions.csv reproduce predictions.csv exactly (same
+  trained model), so the analysis matches the original run numbers.
+
+* casual / ALLSTAR rows are EXCLUDED from all sheets (mercer audios2/4/5/6 only),
+  even though model1 trains on casual.
+
+* The "test only" sweep uses each protocol's own test set: a6 columns over the
+  audios6 test rows, split20 columns over the 20% test fold. Different row
+  subsets by design.
+
+* If --use_augs all errors (cache has no augs), the base cache wasn't extracted
+  with augmentations -- either re-extract with --augs orig,noise,pitch,speed,
+  gain,air,vtlp,combo, or run these with --use_augs "" (no augs).
