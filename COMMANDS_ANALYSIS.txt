@@ -2,9 +2,11 @@
 COMMANDS_ANALYSIS.txt -- 2-model full analysis workbook (6 sheets)
 ================================================================================
 
-Uses ec2/neural_baseline_train.py (v1 -- the script your finalised runs were
-made with). v1 has no --drop_high_ks_features / --prior_correction / --wavlm_layers
-flags, so the commands are the plain config.
+Uses ec2/neural_baseline_train.py (the SAME script your finalised runs were
+made with -- pushed version, no --variants flag, single global seed). Running
+the full 30-variant sweep on this version reproduces the EXACT numbers you
+already have, because each variant's RNG draw matches its position in the
+original sweep.
 
 Two finalised models (from the spec table):
   Model 1:  nn  default_last_pca98  text=yes  aug=all  + casual dataset
@@ -18,8 +20,9 @@ min_duration = 30s on all runs (rows shorter than 30s are dropped).
 
 => 4 training runs (2 data configs x 2 splits), all with
    --dump_full_predictions true. Each run dumps full_predictions.csv per variant
-   (predict on ALL rows with the exact trained model -> test rows reproduce the
-   original numbers). Then build_analysis_excel.py assembles the 6 sheets.
+   with one prediction column per aug (pred_prob = orig; pred_prob_<aug> for
+   each aug in --use_augs). build_analysis_excel.py then assembles the 6 sheets
+   for variants default_last_pca98 (model 1) and tiny_l9_pca95 (model 2).
 
 Uses the BASE cache (embeddings_cache.npz) because aug=all needs the augmented
 embeddings (noise/pitch/speed/...). Independent of the large-model extraction.
@@ -34,6 +37,14 @@ cd ~/speech3 && git pull
 pip install openpyxl          # needed to write the .xlsx (one-time)
 
 --------------------------------------------------------------------------------
+WHY THIS RUNS THE FULL SWEEP (DON'T pass --variants)
+--------------------------------------------------------------------------------
+This script has ONE global seed -- each variant's MLP init + sampler draws
+depend on cumulative RNG state, so a variant's numbers depend on its position
+in the sweep. To reproduce your finalised numbers exactly, run the full sweep
+(no --variants flag). It's slower (30 variants per run) but bit-exact.
+
+--------------------------------------------------------------------------------
 CONFIG (matches your finalised runs)
 --------------------------------------------------------------------------------
 * casual is on MODEL 1 ONLY, as train-only aux (--train_only_batches casual);
@@ -43,7 +54,7 @@ CONFIG (matches your finalised runs)
 * a6 split has NO region filter -> every audios6 row is in the a6 test set
   (both IND and PHP). split_a6_test is train/val/test (no 'unused').
 * --use_augs all, --use_text_features true, --seed 42, --class_balance sampler
-  are v1 defaults; keep identical across all 4 runs so probs match your originals.
+  are defaults; keep identical across all 4 runs so probs match your originals.
 
 --------------------------------------------------------------------------------
 1. MODEL 1 (casual) -- 20% split
@@ -126,21 +137,72 @@ python ec2/build_analysis_excel.py \
 --------------------------------------------------------------------------------
 RESULTING WORKBOOK  (6 sheets)
 --------------------------------------------------------------------------------
-  m1_default_last_pca98_casual_pred    per-file preds (all mercer rows)
-  m1_default_last_pca98_casual_sweep   threshold sweep, all rows
-  m1_default_last_pca98_casual_sweepT  threshold sweep, test rows only
+  m1_default_last_pca98_casual_pred    per-file preds (mercer + casual rows)
+  m1_default_last_pca98_casual_sweep   threshold sweep, all rows  (orig only)
+  m1_default_last_pca98_casual_sweepT  threshold sweep, test rows (orig only)
   m2_tiny_l9_pca95_pred / _sweep / _sweepT
 
 Sheet 1 columns:
-  Filename | real_id (blank for your VLOOKUP) | GT (yes/no) | audios_folder
-  (2/4/5/6) | split_20%_test (train/val/test) | Prediction_prob_20%_test |
-  split_a6_test (train/val/test) | Prediction_prob_a6_test
+  Filename | real_id (blank for VLOOKUP) | GT (yes/no) | region (IND/PHP/CASUAL/UNK)
+  | audios_folder (2/4/5/6/casual)
+  | split_20%_test | Prediction_prob_20%_test
+  | Prediction_prob_20%_test_noise | Prediction_prob_20%_test_pitch | ...    <-- per aug
+  | split_a6_test  | Prediction_prob_a6_test
+  | Prediction_prob_a6_test_noise  | Prediction_prob_a6_test_pitch  | ...    <-- per aug
+
+  -> 'Prediction_prob_*' (no suffix) = prediction on the original (un-augmented) row.
+  -> 'Prediction_prob_*_<aug>'       = prediction on the <aug>-augmented copy
+                                        of the SAME row, scored through the same
+                                        trained model. Use this to check whether
+                                        train rows that score 0 FPs on orig are
+                                        ALSO classified correctly under noise/
+                                        pitch/etc. perturbation (generalisation
+                                        within the aug neighbourhood) or only
+                                        on the clean version (memorisation).
 
 Sweep columns:
   threshold | a6_fp a6_fn a6_tp a6_tn a6_precision a6_recall |
               split20_fp split20_fn split20_tp split20_tn
               split20_precision split20_recall
-  (101 rows, threshold 0.00 -> 1.00 step 0.01)
+  (101 rows, threshold 0.00 -> 1.00 step 0.01; ORIG predictions only)
+
+--------------------------------------------------------------------------------
+"WHY IS THE TRAIN SET 0 FALSE PREDICTIONS?"  (overfitting check)
+--------------------------------------------------------------------------------
+What you saw: when filtering by split=train, FP=FN=0. Val/test look normal.
+
+This is *expected* and not, by itself, evidence of harmful overfitting:
+
+  1. With --use_augs all, the MLP trains on ORIG + 7 augmented copies of every
+     train row = 8x the rows. The dump scores predictions on ORIG only -- the
+     "easiest" copy. A 512->256->128 MLP on a ~600-dim PCA-reduced input has
+     huge capacity to drive train BCE near zero on the clean version, while
+     val F1 (the early-stop signal) gates real generalisation.
+
+  2. Early stopping watches VAL F1, not train loss. The model is allowed to
+     keep memorising train as long as val improves. If val plateaus and test
+     still looks like train (=high F1 with non-trivial recall/precision), you
+     have genuine learning, not memorisation.
+
+  3. The harmful version of this (true overfitting) is: high train F1 + low
+     val/test F1. You don't have that -- your val/test numbers were sensible.
+
+The aug-prediction columns above are the DIRECT diagnostic for memorisation
+vs. generalisation:
+
+  - Pick a few train rows where ORIG is correct (FP=FN=0 region).
+  - Look at Prediction_prob_*_noise / _pitch / _speed / _vtlp / _combo.
+  - If those aug copies stay on the correct side of the threshold ==> the model
+    has learnt features that survive perturbation = real generalisation.
+  - If aug copies flip to the wrong side ==> it really did memorise clean
+    features specific to those rows. THEN it's overfitting.
+
+(One subtle point: augs were in the train set during fit, so the model has
+literally SEEN those exact augmented rows. So train + aug = near-perfect is
+also expected. The interesting diagnostic is whether VAL/TEST rows -- which
+the model has NEVER seen in any aug form -- score consistently across all
+their aug copies. Those are the true generalisation rows. Filter Sheet 1 by
+split=val or split=test and look across the aug columns.)
 
 --------------------------------------------------------------------------------
 NOTES
@@ -148,8 +210,9 @@ NOTES
 * test rows in full_predictions.csv reproduce predictions.csv exactly (same
   trained model), so the analysis matches the original run numbers.
 
-* casual / ALLSTAR rows are EXCLUDED from all sheets (mercer audios2/4/5/6 only),
-  even though model1 trains on casual.
+* casual rows are INCLUDED in the sheets (region = CASUAL). ALLSTAR rows are
+  excluded. Model 2 will show casual rows with split=unused (no training on
+  casual) but still get predictions through its trained model.
 
 * The "test only" sweep uses each protocol's own test set: a6 columns over the
   audios6 test rows, split20 columns over the 20% test fold. Different row
@@ -157,4 +220,5 @@ NOTES
 
 * If --use_augs all errors (cache has no augs), the base cache wasn't extracted
   with augmentations -- either re-extract with --augs orig,noise,pitch,speed,
-  gain,air,vtlp,combo, or run these with --use_augs "" (no augs).
+  gain,air,vtlp,combo, or run these with --use_augs "" (no augs, but then the
+  aug-prediction overfitting check is unavailable).

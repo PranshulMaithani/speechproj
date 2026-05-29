@@ -163,7 +163,8 @@ class TrainResult:
     best_val_f1: float
     best_epoch: int
     test_metrics: dict
-    extra_pred: np.ndarray | None = None  # predictions on --dump_full_predictions matrix
+    # name -> predictions on full-data matrix for that aug (orig + each aug used).
+    extra_preds: dict[str, np.ndarray] | None = None
 
 
 def train_one(X_tr, y_tr, X_va, y_va, X_te, y_te, *, in_dim: int, batch_size: int,
@@ -174,7 +175,8 @@ def train_one(X_tr, y_tr, X_va, y_va, X_te, y_te, *, in_dim: int, batch_size: in
               grad_clip: float = GRAD_CLIP_NORM,
               patience: int = 10,
               class_balance: str = "sampler",
-              extra_predict: np.ndarray | None = None) -> tuple[TrainResult, np.ndarray]:
+              extra_predicts: dict[str, np.ndarray] | None = None,
+              ) -> tuple[TrainResult, np.ndarray]:
     """class_balance:
         'sampler'    WeightedRandomSampler so each minibatch is class-balanced
                      in expectation (default; replaces pos_weight)
@@ -271,8 +273,9 @@ def train_one(X_tr, y_tr, X_va, y_va, X_te, y_te, *, in_dim: int, batch_size: in
 
     test_p = predict(X_te)
     metrics = compute_metrics(y_te, test_p)
-    extra_p = predict(extra_predict) if extra_predict is not None else None
-    return TrainResult(best_val_f1, best_epoch, metrics, extra_pred=extra_p), test_p
+    extra_p = ({name: predict(X) for name, X in extra_predicts.items()}
+               if extra_predicts else None)
+    return TrainResult(best_val_f1, best_epoch, metrics, extra_preds=extra_p), test_p
 
 
 # ----------------------------------------------------------------------------
@@ -453,7 +456,16 @@ def main() -> int:
     # has to fit PCA + MLP.
     per_layer: dict[str, dict] = {}
     for layer in WAVLM_LAYERS:
-        X_orig = concat(wavlm_cache[(layer, "orig")], whisper_cache["orig"], feat_arr)
+        # X_by_aug[name] = full-data concat(wavlm[name], whisper[name], feats)
+        # for every aug requested. Built once per layer and reused for both
+        # the train aug-expansion and the dump_full per-aug prediction.
+        X_by_aug: dict[str, np.ndarray] = {
+            "orig": concat(wavlm_cache[(layer, "orig")], whisper_cache["orig"], feat_arr)
+        }
+        for a in use_augs:
+            X_by_aug[a] = concat(wavlm_cache[(layer, a)], whisper_cache[a], feat_arr)
+
+        X_orig = X_by_aug["orig"]
         zero_rows = (np.abs(X_orig).sum(axis=1) == 0)
         if zero_rows.any():
             log.warning("[layer=%s] %d rows have all-zero orig embeddings",
@@ -463,8 +475,7 @@ def main() -> int:
         y_train_blocks = [y_train_base]
         aug_tag_blocks: list[list[str]] = [["orig"] * len(train_idx)]
         for a in use_augs:
-            X_a = concat(wavlm_cache[(layer, a)], whisper_cache[a], feat_arr)
-            X_train_blocks.append(X_a[train_idx])
+            X_train_blocks.append(X_by_aug[a][train_idx])
             y_train_blocks.append(y_train_base)
             aug_tag_blocks.append([a] * len(train_idx))
 
@@ -489,10 +500,16 @@ def main() -> int:
             "X_val_s": X_val_s, "X_test_s": X_test_s,
             "aug_tags": aug_tags,
         }
-        # For --dump_full_predictions: ALL rows, orig embeddings only, through
-        # the SAME scaler (so train-row predictions are consistent with val/test).
+        # For --dump_full_predictions: ALL rows, ONE matrix PER aug, through
+        # the SAME scaler. Used by build_analysis_excel to score augmented
+        # copies of train rows -- if the model classifies aug copies correctly
+        # too, it generalises within the aug neighbourhood (not just memorising
+        # clean train rows).
         if dump_full:
-            per_layer[layer]["X_all_s"] = scaler.transform(X_orig).astype(np.float32)
+            per_layer[layer]["X_all_by_aug_s"] = {
+                name: scaler.transform(X).astype(np.float32)
+                for name, X in X_by_aug.items()
+            }
 
     # ---- Iterate variants (20 = 2 archs x 2 wavlm layers x 5 PCAs) ----
     summary_rows: list[dict] = []
@@ -514,7 +531,7 @@ def main() -> int:
         if pca_var is None:
             Xt, Xv, Xs = X_train_s, X_val_s, X_test_s
             in_dim = Xt.shape[1]
-            X_all = lp["X_all_s"] if dump_full else None
+            X_all_by_aug = lp["X_all_by_aug_s"] if dump_full else None
         else:
             pca = PCA(n_components=pca_var, svd_solver="full", random_state=args.seed)
             pca.fit(X_train_s)
@@ -523,8 +540,10 @@ def main() -> int:
             Xs = pca.transform(X_test_s).astype(np.float32)
             in_dim = Xt.shape[1]
             log.info("PCA(%.2f) -> %d components", pca_var, in_dim)
-            X_all = (pca.transform(lp["X_all_s"]).astype(np.float32)
-                     if dump_full else None)
+            X_all_by_aug = (
+                {name: pca.transform(X).astype(np.float32)
+                 for name, X in lp["X_all_by_aug_s"].items()}
+                if dump_full else None)
 
         result, test_p = train_one(
             Xt, y_train, Xv, y_val, Xs, y_test,
@@ -532,7 +551,7 @@ def main() -> int:
             lr=args.lr, wd=arch["weight_decay"], device=device, log=log, tag=variant,
             hidden=tuple(arch["hidden"]), dropout=arch["dropout"],
             class_balance=args.class_balance,
-            extra_predict=X_all)
+            extra_predicts=X_all_by_aug)
 
         var_dir = out_dir / variant
         var_dir.mkdir(parents=True, exist_ok=True)
@@ -540,9 +559,16 @@ def main() -> int:
         pred_df["pred_score"] = test_p
         pred_df.to_csv(var_dir / "predictions.csv", index=False)
 
-        # ---- full-data prediction dump (train+val+test, orig embeddings).
+        # ---- full-data prediction dump (train+val+test, orig + each aug).
         # Same trained model -> test rows here equal predictions.csv exactly.
-        if dump_full and result.extra_pred is not None:
+        # pred_prob          = predictions on the ORIGINAL (un-augmented) row
+        # pred_prob_<aug>    = predictions on the <aug>-augmented version of
+        #                      the SAME row, through the same scaler / PCA.
+        # Lets the analysis workbook check whether train rows that score 0
+        # FPs on orig are still classified correctly under aug perturbation
+        # (= generalises within aug neighbourhood) or only on the clean copy
+        # (= memorising clean train features).
+        if dump_full and result.extra_preds is not None:
             full_df = pd.DataFrame({
                 "npy_filename": filenames_cur,
                 "group_id": (gt["group_id"].astype(str).to_numpy()
@@ -554,12 +580,18 @@ def main() -> int:
                            if "region" in gt.columns else ""),
                 "label": y_full,
                 "split": split_label,
-                "pred_prob": result.extra_pred,
+                "pred_prob": result.extra_preds["orig"],
             })
+            for aug_name in use_augs:
+                if aug_name in result.extra_preds:
+                    full_df[f"pred_prob_{aug_name}"] = result.extra_preds[aug_name]
             full_df.to_csv(var_dir / "full_predictions.csv", index=False)
-            log.info("[%s] wrote full_predictions.csv (%d rows: %s)",
+            n_aug_cols = sum(1 for c in full_df.columns if c.startswith("pred_prob_"))
+            log.info("[%s] wrote full_predictions.csv (%d rows: %s; "
+                     "pred_prob + %d aug cols)",
                      variant, len(full_df),
-                     full_df["split"].value_counts().to_dict())
+                     full_df["split"].value_counts().to_dict(),
+                     n_aug_cols)
 
         m = result.test_metrics
         log.info("[%s] TEST n=%d  auc=%.3f  ap=%.3f  thr0.5 f1=%.3f  best_f1=%.3f@%.2f",

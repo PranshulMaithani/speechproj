@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
 """Build the 2-model analysis workbook (6 sheets) from full-prediction dumps.
 
-Consumes the full_predictions.csv files written by neural_baseline_train_v2.py
+Consumes the full_predictions.csv files written by neural_baseline_train.py
 when run with --dump_full_predictions true. Because those dumps come from the
 exact trained model, the numbers here reproduce the original runs exactly.
 
 For EACH model (2 total) it writes 3 sheets:
-  <label>_pred     per-file predictions on ALL mercer rows (train+val+test),
+  <label>_pred     per-file predictions on ALL included rows (train+val+test),
                    with the 20%-split prob/membership AND the a6-split
-                   prob/membership side by side.
-  <label>_sweep    threshold sweep 0.00..1.00 step 0.01 over ALL rows:
+                   prob/membership side by side. Also: per-aug prediction
+                   columns (Prediction_prob_*_<aug>) so you can check whether
+                   train rows that score 0 FPs on orig also score correctly
+                   on augmented copies (= generalises within the aug
+                   neighbourhood) or only on the clean version.
+  <label>_sweep    threshold sweep 0.00..1.00 step 0.01 over ALL rows (orig
+                   predictions only):
                    a6 {fp,fn,tp,tn,prec,recall} and 20% {fp,fn,tp,tn,prec,recall}
   <label>_sweepT   same sweep but TEST rows only (each model's own test set)
 => 6 sheets total.
@@ -20,8 +25,8 @@ Each model needs TWO runs (same variant, two split protocols):
 both launched with --dump_full_predictions true. We read
   <run>/<variant>/full_predictions.csv
 
-Mercer audios only (batch in audios2/4/5/6); casual/ALLSTAR rows are excluded
-from the sheets even if a model trained on them.
+Included rows: mercer (audios2/4/5/6) + casual. ALLSTAR rows are dropped.
+'region' column shows IND / PHP / CASUAL / UNK.
 
 --------------------------------------------------------------------------------
 EXAMPLE
@@ -46,7 +51,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-MERCER_BATCHES = {"audios2", "audios4", "audios5", "audios6"}
+INCLUDED_BATCHES = {"audios2", "audios4", "audios5", "audios6", "casual"}
 THRESHOLDS = np.round(np.arange(0.0, 1.0001, 0.01), 2)
 
 
@@ -54,7 +59,7 @@ def _load_full_pred(run_dir: Path, variant: str) -> pd.DataFrame:
     p = run_dir / variant / "full_predictions.csv"
     if not p.exists():
         raise FileNotFoundError(
-            f"missing {p}\n  -> run neural_baseline_train_v2.py on this config "
+            f"missing {p}\n  -> run neural_baseline_train.py on this config "
             f"with --dump_full_predictions true")
     df = pd.read_csv(p)
     df["batch"] = df["batch"].astype(str)
@@ -63,16 +68,38 @@ def _load_full_pred(run_dir: Path, variant: str) -> pd.DataFrame:
     missing = need - set(df.columns)
     if missing:
         raise ValueError(f"{p} missing columns {missing}")
+    if "region" not in df.columns:
+        df["region"] = ""
     return df
 
 
-def _mercer_only(df: pd.DataFrame) -> pd.DataFrame:
-    return df[df["batch"].isin(MERCER_BATCHES)].reset_index(drop=True)
+def _included_only(df: pd.DataFrame) -> pd.DataFrame:
+    """Keep mercer (audios2/4/5/6) + casual rows; drop ALLSTAR and anything else."""
+    return df[df["batch"].isin(INCLUDED_BATCHES)].reset_index(drop=True)
 
 
 def _audios_folder(batch: str) -> str:
-    # 'audios6' -> '6'
+    # 'audios6' -> '6', 'casual' -> 'casual'
     return batch.replace("audios", "") if batch.startswith("audios") else batch
+
+
+def _aug_names(df: pd.DataFrame) -> list[str]:
+    """Return sorted list of aug names from pred_prob_<aug> columns (excluding the
+    bare 'pred_prob', which is orig)."""
+    augs = []
+    for c in df.columns:
+        if c.startswith("pred_prob_"):
+            augs.append(c[len("pred_prob_"):])
+    return sorted(augs)
+
+
+def _normalise_region(r: str) -> str:
+    r = str(r).strip().upper()
+    if r in ("NAN", "NONE", ""):
+        return "UNK"
+    if r.startswith("CASUAL"):
+        return "CASUAL"
+    return r
 
 
 def confusion_at(p: np.ndarray, y: np.ndarray, t: float) -> dict:
@@ -109,35 +136,52 @@ def sweep_table(p20: np.ndarray, y20: np.ndarray,
 def build_model_sheets(variant: str, run_20pct: Path, run_a6: Path,
                        ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Returns (pred_sheet, sweep_all, sweep_testonly) for one model."""
-    df20 = _mercer_only(_load_full_pred(run_20pct, variant))
-    dfa6 = _mercer_only(_load_full_pred(run_a6, variant))
+    df20 = _included_only(_load_full_pred(run_20pct, variant))
+    dfa6 = _included_only(_load_full_pred(run_a6, variant))
 
-    # Align on npy_filename. label/batch must agree across the two runs.
+    # Aug columns present in BOTH runs (so we can show their probs side-by-side).
+    augs = sorted(set(_aug_names(df20)) & set(_aug_names(dfa6)))
+
+    right_cols = ["npy_filename", "split", "pred_prob"] + [f"pred_prob_{a}" for a in augs]
     m = df20.merge(
-        dfa6[["npy_filename", "split", "pred_prob"]],
+        dfa6[right_cols],
         on="npy_filename", how="inner", suffixes=("_20", "_a6"))
     n_lost = max(len(df20), len(dfa6)) - len(m)
     if n_lost:
         print(f"  WARNING: {n_lost} rows didn't align between the two runs "
               f"(min_duration / batch set differs?)", file=sys.stderr)
 
+    region_col = m["region"].astype(str).map(_normalise_region) if "region" in m.columns \
+                 else pd.Series(["UNK"] * len(m))
+
     # ---- Sheet 1: per-file predictions
-    pred = pd.DataFrame({
+    # Order: identity | GT | region/folder | 20% block (orig + each aug) | a6 block
+    pred_cols: dict[str, object] = {
         "Filename": m["npy_filename"],
         "real_id": "",  # blank for the user's VLOOKUP
         "GT": np.where(m["label"].to_numpy() == 1, "yes", "no"),
+        "region": region_col,             # IND / PHP / CASUAL / UNK
         "audios_folder": m["batch"].map(_audios_folder),
         "split_20%_test": m["split_20"],
         "Prediction_prob_20%_test": m["pred_prob_20"].round(6),
-        "split_a6_test": m["split_a6"],
-        "Prediction_prob_a6_test": m["pred_prob_a6"].round(6),
-    })
+    }
+    for a in augs:
+        col = f"pred_prob_{a}_20"
+        if col in m.columns:
+            pred_cols[f"Prediction_prob_20%_test_{a}"] = m[col].round(6)
+    pred_cols["split_a6_test"] = m["split_a6"]
+    pred_cols["Prediction_prob_a6_test"] = m["pred_prob_a6"].round(6)
+    for a in augs:
+        col = f"pred_prob_{a}_a6"
+        if col in m.columns:
+            pred_cols[f"Prediction_prob_a6_test_{a}"] = m[col].round(6)
+    pred = pd.DataFrame(pred_cols)
 
     y = m["label"].to_numpy().astype(int)
     p20 = m["pred_prob_20"].to_numpy().astype(float)
     pa6 = m["pred_prob_a6"].to_numpy().astype(float)
 
-    # ---- Sheet 2: sweep over ALL rows (train+val+test)
+    # ---- Sheet 2: sweep over ALL rows (train+val+test) -- orig predictions only
     sweep_all = sweep_table(p20, y, pa6, y)
 
     # ---- Sheet 3: sweep over TEST rows only (each model's own test set)
@@ -145,6 +189,7 @@ def build_model_sheets(variant: str, run_20pct: Path, run_a6: Path,
     testa6 = (m["split_a6"] == "test").to_numpy()
     sweep_test = sweep_table(p20[test20], y[test20], pa6[testa6], y[testa6])
 
+    print(f"  aug columns: {augs if augs else '(none)'}")
     return pred, sweep_all, sweep_test
 
 
