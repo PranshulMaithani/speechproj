@@ -222,3 +222,49 @@ NOTES
   with augmentations -- either re-extract with --augs orig,noise,pitch,speed,
   gain,air,vtlp,combo, or run these with --use_augs "" (no augs, but then the
   aug-prediction overfitting check is unavailable).
+
+--------------------------------------------------------------------------------
+EXPORT + DOWNLOAD THE TRAINED MODELS  (--export_artifacts)
+--------------------------------------------------------------------------------
+Training does NOT save weights by default. To get downloadable models, add
+  --export_artifacts true
+to the SAME training commands (1-4 above). Re-run the full sweep (no --variants)
+so the exported weights are the EXACT ones behind your finalised numbers.
+
+It writes, into EVERY <out_dir>/<variant>/ :
+  model.pt             MLP weights (state_dict, cpu tensors)
+  scaler.joblib        the fitted StandardScaler (per WavLM layer)
+  pca.joblib           the fitted PCA (omitted when pca=full)
+  inference_meta.json  arch/hidden/dropout, wavlm_layer, pca, in_dim, feat_cols
+                       (ordered), wavlm_id/whisper_id, target_sr, best_epoch,
+                       best_f1_threshold, and the exact feature_order to rebuild
+                       the input vector.
+
+Your 2 models live at:
+  Model 1: <m1 run>/default_last_pca98/{model.pt,scaler.joblib,pca.joblib,inference_meta.json}
+  Model 2: <m2 run>/tiny_l9_pca95/{model.pt,scaler.joblib,pca.joblib,inference_meta.json}
+(Model 1's reproducible run is the 20% OR a6 command depending which split you
+want; the artifacts differ per split because train data differs.)
+
+ZIP the two variant folders on EC2:
+  cd /home/ubuntu/nn/runs
+  zip -r selected_models.zip \
+      m1_casual_20pct/default_last_pca98 \
+      m2_nocasual_20pct/tiny_l9_pca95
+
+DOWNLOAD to your laptop (run on the LAPTOP):
+  scp -i <key.pem> ubuntu@<EC2_IP>:/home/ubuntu/nn/runs/selected_models.zip .
+
+MINIMAL INFERENCE (per audio), using a downloaded variant folder:
+  import json, joblib, numpy as np, torch
+  meta = json.load(open("inference_meta.json"))
+  scaler = joblib.load("scaler.joblib")
+  pca = joblib.load("pca.joblib") if meta["pca"] is not None else None
+  # x = concat[ wavlm[meta.wavlm_layer] | whisper | feat_* (meta.feat_cols order) ]
+  x = scaler.transform(x[None, :])
+  if pca is not None: x = pca.transform(x)
+  # rebuild the same MLP arch (see MLP class) with in_dim=meta["in_dim"],
+  # hidden=meta["hidden"], dropout=meta["dropout"]; load_state_dict(torch.load("model.pt"))
+  # prob = sigmoid(model(x)); cheat = prob >= meta["best_f1_threshold"]
+  -> feed wavlm/whisper from extract_embeddings.py (same wavlm_id/whisper_id,
+     TARGET_SR=16000) and feat_* exactly as in gt.csv.

@@ -75,6 +75,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+import joblib
 import numpy as np
 import pandas as pd
 import torch
@@ -165,6 +166,8 @@ class TrainResult:
     test_metrics: dict
     # name -> predictions on full-data matrix for that aug (orig + each aug used).
     extra_preds: dict[str, np.ndarray] | None = None
+    # best-epoch MLP weights (cpu tensors); only set when export_model=True.
+    model_state: dict | None = None
 
 
 def train_one(X_tr, y_tr, X_va, y_va, X_te, y_te, *, in_dim: int, batch_size: int,
@@ -176,6 +179,7 @@ def train_one(X_tr, y_tr, X_va, y_va, X_te, y_te, *, in_dim: int, batch_size: in
               patience: int = 10,
               class_balance: str = "sampler",
               extra_predicts: dict[str, np.ndarray] | None = None,
+              export_model: bool = False,
               ) -> tuple[TrainResult, np.ndarray]:
     """class_balance:
         'sampler'    WeightedRandomSampler so each minibatch is class-balanced
@@ -275,7 +279,10 @@ def train_one(X_tr, y_tr, X_va, y_va, X_te, y_te, *, in_dim: int, batch_size: in
     metrics = compute_metrics(y_te, test_p)
     extra_p = ({name: predict(X) for name, X in extra_predicts.items()}
                if extra_predicts else None)
-    return TrainResult(best_val_f1, best_epoch, metrics, extra_preds=extra_p), test_p
+    model_state = ({k: v.cpu() for k, v in best_state.items()}
+                   if (export_model and best_state is not None) else None)
+    return TrainResult(best_val_f1, best_epoch, metrics, extra_preds=extra_p,
+                       model_state=model_state), test_p
 
 
 # ----------------------------------------------------------------------------
@@ -329,6 +336,15 @@ def main() -> int:
                          "question_id, batch, region, label, split, pred_prob). "
                          "Used by build_analysis_excel.py. Reuses the exact "
                          "trained model so test rows equal predictions.csv.")
+    ap.add_argument("--export_artifacts", default="false",
+                    choices=["true", "false"],
+                    help="For every variant, save the trained MLP weights "
+                         "(model.pt), the fitted StandardScaler (scaler.joblib), "
+                         "the PCA (pca.joblib, omitted for pca=full) and an "
+                         "inference_meta.json into <out_dir>/<variant>/. Lets you "
+                         "download a variant and run inference offline. Re-run "
+                         "the SAME full sweep with this flag to export the exact "
+                         "weights behind your finalised numbers.")
     ap.add_argument("--batch_size", type=int, default=64)
     ap.add_argument("--epochs", type=int, default=60)
     ap.add_argument("--lr", type=float, default=1e-3)
@@ -345,6 +361,7 @@ def main() -> int:
     use_text_features = (args.use_text_features == "true")
     do_per_client_std = (args.per_client_standardize == "true")
     dump_full = (args.dump_full_predictions == "true")
+    export_artifacts = (args.export_artifacts == "true")
     train_batches = [b.strip() for b in args.train_batches.split(",") if b.strip()]
     test_batches = [b.strip() for b in args.test_batches.split(",") if b.strip()]
     train_only_batches = [b.strip() for b in args.train_only_batches.split(",") if b.strip()]
@@ -499,6 +516,7 @@ def main() -> int:
             "X_train_s": X_train_s, "y_train": y_train,
             "X_val_s": X_val_s, "X_test_s": X_test_s,
             "aug_tags": aug_tags,
+            "scaler": scaler,  # needed by --export_artifacts
         }
         # For --dump_full_predictions: ALL rows, ONE matrix PER aug, through
         # the SAME scaler. Used by build_analysis_excel to score augmented
@@ -510,6 +528,20 @@ def main() -> int:
                 name: scaler.transform(X).astype(np.float32)
                 for name, X in X_by_aug.items()
             }
+
+    # ---- Common metadata for --export_artifacts (computed once) ----
+    if export_artifacts:
+        exp_wavlm_dim = int(wavlm_cache[(WAVLM_LAYERS[0], "orig")].shape[1])
+        exp_whisper_dim = int(whisper_cache["orig"].shape[1])
+        try:
+            _cmeta = np.load(cache_path, allow_pickle=True)
+            exp_wavlm_id = str(_cmeta["wavlm_id"]) if "wavlm_id" in _cmeta else ""
+            exp_whisper_id = str(_cmeta["whisper_id"]) if "whisper_id" in _cmeta else ""
+        except Exception:
+            exp_wavlm_id = exp_whisper_id = ""
+        log.info("export_artifacts ON: wavlm_dim=%d whisper_dim=%d feat=%d",
+                 exp_wavlm_dim, exp_whisper_dim,
+                 len(feat_cols) if (feat_cols and use_text_features) else 0)
 
     # ---- Iterate variants (20 = 2 archs x 2 wavlm layers x 5 PCAs) ----
     summary_rows: list[dict] = []
@@ -551,7 +583,8 @@ def main() -> int:
             lr=args.lr, wd=arch["weight_decay"], device=device, log=log, tag=variant,
             hidden=tuple(arch["hidden"]), dropout=arch["dropout"],
             class_balance=args.class_balance,
-            extra_predicts=X_all_by_aug)
+            extra_predicts=X_all_by_aug,
+            export_model=export_artifacts)
 
         var_dir = out_dir / variant
         var_dir.mkdir(parents=True, exist_ok=True)
@@ -631,6 +664,40 @@ def main() -> int:
                        "best_val_f1": result.best_val_f1,
                        "best_epoch": result.best_epoch,
                        "test": m}, f, indent=2)
+
+        # ---- export trained artifacts for offline inference / download
+        if export_artifacts and result.model_state is not None:
+            torch.save(result.model_state, var_dir / "model.pt")
+            joblib.dump(lp["scaler"], var_dir / "scaler.joblib")
+            if pca_var is not None:
+                joblib.dump(pca, var_dir / "pca.joblib")
+            n_feat = len(feat_cols) if (feat_cols and use_text_features) else 0
+            with (var_dir / "inference_meta.json").open("w") as f:
+                json.dump({
+                    "variant": variant, "arch": arch_name, "wavlm_layer": layer,
+                    "hidden": list(arch["hidden"]), "dropout": arch["dropout"],
+                    "weight_decay": arch["weight_decay"], "pca": pca_var,
+                    "in_dim": in_dim, "use_augs": use_augs,
+                    "use_text_features": use_text_features,
+                    "feat_cols": feat_cols if (feat_cols and use_text_features) else [],
+                    "class_balance": args.class_balance,
+                    "label_smoothing": LABEL_SMOOTHING,
+                    "best_epoch": result.best_epoch,
+                    "best_val_f1": result.best_val_f1,
+                    "best_f1_threshold": m["best_f1"]["threshold"],
+                    "thr0.5_f1": m["thr0.5"]["f1"],
+                    "wavlm_dim": exp_wavlm_dim, "whisper_dim": exp_whisper_dim,
+                    "wavlm_id": exp_wavlm_id, "whisper_id": exp_whisper_id,
+                    "target_sr": 16000,
+                    "feature_order": (
+                        f"concat[ wavlm[{layer}] ({exp_wavlm_dim}) | "
+                        f"whisper ({exp_whisper_dim}) | feat_* ({n_feat}) ] "
+                        f"-> scaler.transform -> "
+                        f"{'pca.transform -> ' if pca_var is not None else ''}"
+                        f"MLP -> sigmoid; predict 1 if prob >= best_f1_threshold"),
+                }, f, indent=2)
+            log.info("[%s] exported model.pt + scaler.joblib%s + inference_meta.json",
+                     variant, " + pca.joblib" if pca_var is not None else "")
 
         ind = extract_region_metrics(m, "IND")
         php = extract_region_metrics(m, "PHP")
