@@ -1,0 +1,131 @@
+================================================================================
+COMMANDS_AUG_SAMPLES.txt
+  A) Augmentation ablation  -- which augs HELP vs HURT the 2 models (EC2)
+  B) Listen to the augmentations -- npy sample package + local wav builder
+================================================================================
+
+Two unrelated jobs, run independently.
+
+--------------------------------------------------------------------------------
+PRE-FLIGHT (EC2)
+--------------------------------------------------------------------------------
+cd ~/speech3 && git pull
+# ablation reuses train_one from neural_baseline_train.py (same model math).
+# packager reuses the exact augmenters from extract_embeddings.py.
+
+================================================================================
+A)  AUGMENTATION ABLATION   (ec2/aug_ablation.py)
+================================================================================
+Goal: for the 2 finalised models, attribute which of the 7 augs help/hurt --
+WITHOUT the 2^7=128 subset grid (combinatorial + drowned in seed noise on small
+candidate-wise test sets).
+
+Models (hardcoded):
+  Model 1: default / wavlm 'last' / pca98 / + casual (train-only)
+  Model 2: tiny    / wavlm  l9    / pca95 / no casual
+Splits: BOTH 20pct (60/20/20 candidate-wise) and a6 (test = all audios6).
+
+Key design:
+  * SPLIT IS FROZEN (single --split_seed): same candidates in train/val/test for
+    every aug config + seed, so the aug set is the ONLY variable.
+  * Only the TRAINING seed varies (MLP init / sampler / dropout). Averaging over
+    --seeds separates a real aug effect from init luck. An aug "helps/hurts" only
+    if |delta vs all| exceeds the seed std.
+  * This is a SEPARATE experiment from the finalised runs -- it reseeds per run
+    and does NOT reproduce the headline numbers bit-for-bit. That's expected.
+
+Modes (--mode):
+  loo     leave-one-out: 'all', 'drop_<aug>' x7, 'none'  (9 configs). Cleanest
+          per-aug signal, lowest selection bias. (default)
+  greedy  forward selection: start none, repeatedly add the aug that most
+          improves mean VAL F1 (reports test). ~O(n^2) configs, finds a good
+          subset + main interactions. Selection on val, NEVER test.
+  both    run loo then greedy.
+
+RUN (both modes, both splits, 5 seeds):
+python ec2/aug_ablation.py \
+    --data_dir /home/ubuntu/nn/data \
+    --cache    /home/ubuntu/nn/data/embeddings_cache.npz \
+    --out_dir  /home/ubuntu/nn/runs/aug_ablation \
+    --seeds 42,43,44,45,46 \
+    --mode both
+
+(faster first look: --seeds 42,43,44  and/or --mode loo)
+
+OUTPUTS (in --out_dir):
+  aug_ablation_raw.csv      one row per (model, split, phase, aug_config, seed)
+  aug_ablation_summary.csv  LOO: per (model,split,aug_config) mean/std test F1,
+                            delta_test_best_f1 vs 'all', verdict
+  aug_greedy_path.csv       greedy: step | chosen_aug | selected_set |
+                            mean_val_f1 | mean_test_best_f1
+  log_ablation.txt          full log (also prints the tables)
+
+READING:
+  LOO     'drop_X' with NEGATIVE delta => removing X hurt => X HELPS.
+          POSITIVE delta => removing X helped => X HURTS.
+          Trust only deltas whose |.| > the 'all' seed std (else '~neutral').
+  greedy  last selected_set = recommended subset; its mean_test_best_f1 is the
+          held-out estimate (selection was on val).
+
+================================================================================
+B)  LISTEN TO THE AUGMENTATIONS   (2 scripts, npy -> wav only locally)
+================================================================================
+PII boundary:
+  * Only .npy (numpy waveforms) + CODED ids (group_id) ever leave a machine.
+  * NO .wav and NO real candidate ids are written on the EC2/packaging side.
+  * wav files are created ONLY locally, by the second script.
+
+DATA FLOW:
+  [EC2 or laptop]  make_sample_package.py
+        audio_npy/*.npy + gt.csv  -> apply 8 augs (exact training augmenters)
+        -> aug_samples.zip   (npy + coded ids + manifest.csv)
+   --(copy zip + your LOCAL cid_mapping.json to the listening machine)-->
+  [listening machine]  make_listen_wavs.py
+        -> npy -> wav, de-anonymize coded->real id
+        -> samples/<batchtag>/<real_id>/<id>_q<qid>_<aug>.wav   (LOCAL ONLY)
+
+--------------------------------------------------------------------------------
+B1. PACKAGE (run where audio_npy/ lives -- EC2 or company laptop)
+--------------------------------------------------------------------------------
+python ec2/make_sample_package.py \
+    --data_dir /home/ubuntu/nn/data \
+    --out_zip  /home/ubuntu/nn/runs/aug_samples.zip
+
+Defaults: 5 candidates/batch having ALL of Q25/26/27; audios6 split 5 IND + 5 PHP;
+8 versions each (orig + noise,pitch,speed,gain,air,vtlp,combo).
+  single-region batch -> 5 x 3 x 8 = 120 npy ;  audios6 -> 10 x 3 x 8 = 240 npy
+
+Optional flags:
+  --batches audios2,audios3,audios4,audios5,audios6   (add/remove batches)
+  --region_split_batches audios6                      (which batches split by region)
+  --per_batch 5            (candidates per batch / per region)
+  --questions 25,26,27
+  --augs orig,noise,pitch,speed,gain,air,vtlp,combo
+  --seed 42               (deterministic candidate selection)
+
+The zip contains: npy/<batch>__<group_id>__<region>__q<qid>__<aug>.npy + manifest.csv
+
+--------------------------------------------------------------------------------
+B2. BUILD WAVS (run LOCALLY, in the folder with the zip + cid_mapping.json)
+--------------------------------------------------------------------------------
+# deps:  pip install soundfile        (numpy already present)
+python make_listen_wavs.py \
+    --zip aug_samples.zip \
+    --cid_mapping cid_mapping.json \
+    --out_dir samples
+
+  --keep_coded   name folders by coded group_id (skip de-anonymization)
+
+OUTPUT TREE:
+  samples/
+    a2sample/<real_id>/<real_id>_q25_orig.wav
+                       <real_id>_q25_noise.wav ... (8 augs)
+                       <real_id>_q26_*.wav  <real_id>_q27_*.wav
+    a4sample/...  a5sample/...
+    a6sample_IND/<real_id>/...   a6sample_PHP/<real_id>/...
+    manifest_real.csv      (local index incl. real ids -- do NOT upload)
+
+batchtag rule: audios2->a2sample, audios3->a3sample, ... ; audios6 split by region.
+Per candidate: 3 questions x 8 augs = 24 wav. Listen across the 8 augs of one
+question to judge whether an augmentation is reasonable or destroys the speech.
+================================================================================
