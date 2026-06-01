@@ -16,7 +16,11 @@ For EACH model (2 total) it writes 3 sheets:
   <label>_sweep    threshold sweep 0.00..1.00 step 0.01 over ALL rows (orig
                    predictions only):
                    a6 {fp,fn,tp,tn,prec,recall} and 20% {fp,fn,tp,tn,prec,recall}
-  <label>_sweepT   same sweep but TEST rows only (each model's own test set)
+  <label>_sweepT   same threshold sweep but over each model's own TEST set AND
+                   VAL set side by side, for both protocols. Per threshold:
+                   a6 {fp,fn,tp,tn,prec,recall} | a6_val {...} |
+                   split20 {...} | split20_val {...}
+                   -> compare how val tracks test at each threshold.
 => 6 sheets total.
 
 Each model needs TWO runs (same variant, two split protocols):
@@ -133,6 +137,43 @@ def sweep_table(p20: np.ndarray, y20: np.ndarray,
     return pd.DataFrame(rows)
 
 
+def sweep_table_test_val(p20t: np.ndarray, y20t: np.ndarray,
+                         p20v: np.ndarray, y20v: np.ndarray,
+                         pa6t: np.ndarray, ya6t: np.ndarray,
+                         pa6v: np.ndarray, ya6v: np.ndarray) -> pd.DataFrame:
+    """One row per threshold with TEST and VAL confusion side by side, both
+    protocols. Per-threshold column order: a6 test | a6 val | 20% test | 20% val.
+    Lets you compare, at each threshold, how val tracks test (generalisation /
+    threshold stability). Test columns keep their original names (a6_*,
+    split20_*); val columns are suffixed _val."""
+    rows = []
+    for t in THRESHOLDS:
+        a6t = confusion_at(pa6t, ya6t, t)
+        a6v = confusion_at(pa6v, ya6v, t)
+        s20t = confusion_at(p20t, y20t, t)
+        s20v = confusion_at(p20v, y20v, t)
+        rows.append({
+            "threshold": t,
+            # ---- a6 TEST
+            "a6_fp": a6t["fp"], "a6_fn": a6t["fn"], "a6_tp": a6t["tp"],
+            "a6_tn": a6t["tn"], "a6_precision": a6t["precision"], "a6_recall": a6t["recall"],
+            # ---- a6 VAL
+            "a6_val_fp": a6v["fp"], "a6_val_fn": a6v["fn"], "a6_val_tp": a6v["tp"],
+            "a6_val_tn": a6v["tn"], "a6_val_precision": a6v["precision"],
+            "a6_val_recall": a6v["recall"],
+            # ---- split20 TEST
+            "split20_fp": s20t["fp"], "split20_fn": s20t["fn"], "split20_tp": s20t["tp"],
+            "split20_tn": s20t["tn"], "split20_precision": s20t["precision"],
+            "split20_recall": s20t["recall"],
+            # ---- split20 VAL
+            "split20_val_fp": s20v["fp"], "split20_val_fn": s20v["fn"],
+            "split20_val_tp": s20v["tp"], "split20_val_tn": s20v["tn"],
+            "split20_val_precision": s20v["precision"],
+            "split20_val_recall": s20v["recall"],
+        })
+    return pd.DataFrame(rows)
+
+
 def build_model_sheets(variant: str, run_20pct: Path, run_a6: Path,
                        ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Returns (pred_sheet, sweep_all, sweep_testonly) for one model."""
@@ -184,12 +225,19 @@ def build_model_sheets(variant: str, run_20pct: Path, run_a6: Path,
     # ---- Sheet 2: sweep over ALL rows (train+val+test) -- orig predictions only
     sweep_all = sweep_table(p20, y, pa6, y)
 
-    # ---- Sheet 3: sweep over TEST rows only (each model's own test set)
+    # ---- Sheet 3: sweep over TEST rows AND VAL rows side by side (each model's
+    # own test/val set), so val vs test confusion can be compared per threshold.
     test20 = (m["split_20"] == "test").to_numpy()
     testa6 = (m["split_a6"] == "test").to_numpy()
-    sweep_test = sweep_table(p20[test20], y[test20], pa6[testa6], y[testa6])
+    val20 = (m["split_20"] == "val").to_numpy()
+    vala6 = (m["split_a6"] == "val").to_numpy()
+    sweep_test = sweep_table_test_val(
+        p20[test20], y[test20], p20[val20], y[val20],
+        pa6[testa6], y[testa6], pa6[vala6], y[vala6])
 
     print(f"  aug columns: {augs if augs else '(none)'}")
+    print(f"  sweepT rows: 20% test={int(test20.sum())} val={int(val20.sum())}  "
+          f"a6 test={int(testa6.sum())} val={int(vala6.sum())}")
     return pred, sweep_all, sweep_test
 
 

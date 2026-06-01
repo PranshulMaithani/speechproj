@@ -138,8 +138,8 @@ python ec2/build_analysis_excel.py \
 RESULTING WORKBOOK  (6 sheets)
 --------------------------------------------------------------------------------
   m1_default_last_pca98_casual_pred    per-file preds (mercer + casual rows)
-  m1_default_last_pca98_casual_sweep   threshold sweep, all rows  (orig only)
-  m1_default_last_pca98_casual_sweepT  threshold sweep, test rows (orig only)
+  m1_default_last_pca98_casual_sweep   threshold sweep, all rows       (orig only)
+  m1_default_last_pca98_casual_sweepT  threshold sweep, TEST + VAL rows (orig only)
   m2_tiny_l9_pca95_pred / _sweep / _sweepT
 
 Sheet 1 columns:
@@ -160,11 +160,22 @@ Sheet 1 columns:
                                         within the aug neighbourhood) or only
                                         on the clean version (memorisation).
 
-Sweep columns:
+Sweep columns (_sweep, ALL rows):
   threshold | a6_fp a6_fn a6_tp a6_tn a6_precision a6_recall |
               split20_fp split20_fn split20_tp split20_tn
               split20_precision split20_recall
   (101 rows, threshold 0.00 -> 1.00 step 0.01; ORIG predictions only)
+
+SweepT columns (_sweepT, TEST + VAL side by side, both protocols):
+  threshold
+  | a6_fp a6_fn a6_tp a6_tn a6_precision a6_recall                     <- a6 TEST
+  | a6_val_fp a6_val_fn a6_val_tp a6_val_tn a6_val_precision a6_val_recall   <- a6 VAL
+  | split20_fp ... split20_recall                                     <- 20% TEST
+  | split20_val_fp ... split20_val_recall                             <- 20% VAL
+  (101 rows; ORIG predictions only). Compare a6 vs a6_val (and split20 vs
+  split20_val) at each threshold: if val and test confusion track each other,
+  the chosen operating threshold generalises; if they diverge, the threshold
+  is overfit to one split.
 
 --------------------------------------------------------------------------------
 "WHY IS THE TRAIN SET 0 FALSE PREDICTIONS?"  (overfitting check)
