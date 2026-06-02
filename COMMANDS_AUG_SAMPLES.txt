@@ -98,27 +98,45 @@ python ec2/aug_ablation2.py \
     --runs_root  /home/ubuntu/nn/runs \
     --seeds 42,43,44,45,46 \
     --mode both
-# override dir names if different: --m1_a6_dir / --m1_20pct_dir /
-#                                  --m2_a6_dir / --m2_20pct_dir
+# override primary dir names if different:
+#   --m1_a6_dir / --m1_20pct_dir / --m2_a6_dir / --m2_20pct_dir
+# OPTIONAL no-aug anchor: if you ALSO have separately no-aug-trained, exported
+# runs, pass them to load+predict an exact 'none' anchor too:
+#   --m1_a6_none_dir <dir> --m1_20pct_none_dir <dir>
+#   --m2_a6_none_dir <dir> --m2_20pct_none_dir <dir>
+# (the anchor auto-reads each inference_meta.json: an all-aug run anchors 'all',
+#  a no-aug run anchors 'none' -- the anchor_original sheet's orig_use_augs
+#  column tells you what each finalised dir actually was.)
 
 OUTPUTS (in --out_dir):
-  aug_ablation2.xlsx        sheets: anchor_original | loo_summary | greedy_path | raw
-  aug_ablation2_anchor.csv  EXACT original metrics (load+predict) + verify cols:
-                            test_groups_match_orig (YES = same candidates),
-                            pred_max_abs_diff (<1e-3 = faithful reproduction)
-  aug_ablation2_summary.csv LOO mean/std + delta vs fresh 'all' AND vs the
-                            ORIGINAL anchor (delta_*_vs_anchor / anchor_recall@p90)
-  aug_ablation2_raw.csv     per (model,split,aug_config,seed) fresh-run rows
-  aug_greedy2_path.csv      greedy forward-selection path
+  aug_ablation2.xlsx               sheets: anchor_original | loo_summary_5seed |
+                                   loo_summary_1seed | greedy_path | raw
+  aug_ablation2_anchor.csv         EXACT original metrics (load+predict) per
+                                   loaded model, with aug_kind (all/none),
+                                   orig_use_augs, and verify cols:
+                                   test_groups_match_orig (YES = same candidates),
+                                   pred_max_abs_diff (<1e-3 = faithful repro)
+  aug_ablation2_summary_5seed.csv  LOO mean/std over all 5 seeds + deltas
+  aug_ablation2_summary_1seed.csv  LOO at seed 42 ONLY (single-draw replication,
+                                   closest to how the headline number was made)
+  aug_ablation2_raw.csv            per (model,split,aug_config,seed) fresh rows
+  aug_greedy2_path.csv             greedy forward-selection path (5-seed val)
 
 READING:
-  * anchor_original  = the real headline number, reproduced. If pred_max_abs_diff
-    is ~0 and test_groups_match_orig=YES, the load->predict path is exact.
-  * loo_summary delta_test_best_f1 = vs the FRESH 5-seed 'all' (clean aug effect,
-    init-luck removed). delta_*_vs_anchor = vs the ORIGINAL single model (shows
-    how much of the headline number was training luck vs augmentation).
-  * NOTE: there is no original 'none' (the sheet was all-aug), so 'none' is a
-    fresh-trained floor only -- it has no anchor counterpart.
+  * anchor_original  = the real headline numbers, reproduced by loading the
+    original weights. If pred_max_abs_diff ~0 and test_groups_match_orig=YES,
+    the load->predict path is exact.
+  * 5-seed sheet = honest, init-luck-averaged aug effect.
+    1-seed sheet = a single seed-42 training draw (this is the regime the
+    original headline number lived in -- e.g. the M2/a6 48 vs 30 gap).
+  * delta_test_best_f1 = vs the FRESH 'all' in that same sheet (clean aug
+    effect). delta_*_vs_anchor = vs the ORIGINAL loaded model: 'all' configs vs
+    the all-anchor, 'none' vs the none-anchor (if a no-aug run was provided).
+  * If you did NOT pass --*_none_dir and your finalised runs are all-aug, there
+    is no original 'none' weights to load -- 'none' stays the fresh floor and
+    its delta_*_vs_anchor is NaN. To get an exact none anchor, train+export a
+    no-aug run (neural_baseline_train ... --use_augs "" --export_artifacts true)
+    and pass its dir via --*_none_dir.
 
 ================================================================================
 B)  LISTEN TO THE AUGMENTATIONS   (2 scripts, npy -> wav only locally)

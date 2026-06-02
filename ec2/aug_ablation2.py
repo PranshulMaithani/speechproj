@@ -12,14 +12,21 @@ Why this exists (vs aug_ablation.py):
   original exported artifacts (model.pt + scaler.joblib + pca.joblib +
   inference_meta.json) and runs real inference on the test rows. That anchor
   row IS the exact headline number (e.g. M2/a6 recall@p90 = 0.48), reproduced
-  by predicting with the original weights -- not copied from a CSV.
+  by predicting with the original weights -- not copied from a CSV. The anchor
+  is labelled by the model's actual use_augs (read from inference_meta.json),
+  so an all-aug run anchors 'all' and a no-aug run anchors 'none'. Pass the
+  optional --*_none_dir flags to ALSO anchor a separately no-aug-trained run.
 
   It first PROVES the split is the identical candidate partition (the frozen
   split's test group_ids must equal the original predictions.csv group_ids,
   and the reconstructed test probabilities must equal the saved pred_score),
-  then runs the same LOO + greedy ablation on that frozen split. Every delta in
-  the workbook is read against BOTH the true anchor 'all' and the fresh 5-seed
-  'all', so the augmentation effect is separated from training luck.
+  then runs the same LOO + greedy ablation on that frozen split.
+
+Two views of the fresh ablation, in SEPARATE sheets (no extra compute -- both
+derive from the same per-seed raw rows):
+  * 5-seed mean  : the honest, init-luck-averaged estimate (loo_summary_5seed)
+  * 1-seed (seed 42): a single training draw -- closest to how the original
+                      headline number was produced (loo_summary_1seed)
 
 Split identity (confirmed with the user): original runs used --seed 42 and
 --min_duration 30 (defaults), so build_splits(seed=42) reproduces the same
@@ -28,14 +35,13 @@ change val/test (train_only rows never enter val/test); it only adds rows to
 TRAIN, which is baked into the saved weights and so does not affect the anchor.
 
 Outputs (in --out_dir):
-  aug_ablation2_anchor.csv   one row per (model, split): EXACT original metrics
-                             from load+predict, + split/pred-match verification
-  aug_ablation2_raw.csv      one row per (model, split, phase, aug_config, seed)
-                             -- the fresh ablation runs on the frozen split
-  aug_ablation2_summary.csv  LOO: mean/std per config + delta vs fresh 'all'
-                             AND delta vs the ORIGINAL anchor 'all'
-  aug_greedy2_path.csv       greedy forward-selection path
-  aug_ablation2.xlsx         all of the above as sheets (anchor / loo / greedy / raw)
+  aug_ablation2_anchor.csv      one row per loaded original model (all and/or
+                                none): EXACT metrics + split/pred verification
+  aug_ablation2_raw.csv         one row per (model, split, phase, aug_config, seed)
+  aug_ablation2_summary_5seed.csv  LOO mean/std over all seeds + deltas vs anchors
+  aug_ablation2_summary_1seed.csv  LOO at seed 42 only (single-draw replication)
+  aug_greedy2_path.csv          greedy forward-selection path (5-seed val)
+  aug_ablation2.xlsx            all of the above as sheets
 
 Run:
   python ec2/aug_ablation2.py \
@@ -64,11 +70,23 @@ from _data_pipeline import (assert_no_group_leak, build_splits, compute_metrics,
 from neural_baseline_train import ARCH_CONFIG, MLP, train_one
 from aug_ablation import TRAIN_BATCHES, _l9, _summarise, build_xy
 
+_RP_KEYS = ["recall@p80", "recall@p85", "recall@p90", "recall@p95"]
+
 
 def _rp(rap: dict, k: str) -> float:
     """recall at fixed precision out of compute_metrics' recall_at_precision."""
     v = rap.get(k, {})
     return v.get("recall", float("nan")) if isinstance(v, dict) else float("nan")
+
+
+def _aug_kind(use_augs: str) -> str:
+    """Normalise a run's --use_augs string to the ablation config it anchors."""
+    s = (use_augs or "").strip().lower()
+    if s in ("", "none"):
+        return "none"
+    if s == "all":
+        return "all"
+    return s  # an explicit subset -- anchored under its own label
 
 
 @torch.no_grad()
@@ -115,8 +133,7 @@ def verify_split(gt: pd.DataFrame, test_idx: np.ndarray, var_dir: Path,
                  test_p: np.ndarray, log) -> dict:
     """Prove the frozen split's test set == the original run's test set, and
     that our reconstructed probabilities == the saved pred_score."""
-    res = {"test_groups_match": "NO_FILE", "pred_max_abs_diff": float("nan"),
-           "n_test": int(len(test_idx))}
+    res = {"test_groups_match": "NO_FILE", "pred_max_abs_diff": float("nan")}
     pred_path = var_dir / "predictions.csv"
     if not pred_path.exists():
         log.warning("  [verify] %s has no predictions.csv -- cannot verify", var_dir)
@@ -137,13 +154,11 @@ def verify_split(gt: pd.DataFrame, test_idx: np.ndarray, var_dir: Path,
             log.info("  [verify] test candidates match original (%d groups)",
                      len(frozen_groups))
 
-    # pred_score match (the real proof the whole load->predict path is faithful)
     score_col = next((c for c in ("pred_score", "pred_prob") if c in orig.columns), None)
     if score_col and "npy_filename" in orig.columns and len(test_p) == len(test_idx):
         cur = pd.DataFrame({
             "npy_filename": gt.iloc[test_idx]["npy_filename"].astype(str).to_numpy(),
-            "p_recon": test_p,
-        })
+            "p_recon": test_p})
         merged = cur.merge(orig[["npy_filename", score_col]].astype({"npy_filename": str}),
                            on="npy_filename", how="inner")
         if len(merged):
@@ -156,6 +171,42 @@ def verify_split(gt: pd.DataFrame, test_idx: np.ndarray, var_dir: Path,
     return res
 
 
+def anchor_one(var_dir: Path, label: str, split_name: str, X_test_orig: np.ndarray,
+               y_test: np.ndarray, arch: dict, device: torch.device,
+               gt: pd.DataFrame, test_idx: np.ndarray, log) -> dict | None:
+    """Load one exported original model, predict, verify, return an anchor row
+    (labelled by its actual use_augs). None if model.pt is absent."""
+    if not (var_dir / "model.pt").exists():
+        log.error("[%s/%s] no model.pt at %s -- skipping this anchor.",
+                  label, split_name, var_dir)
+        return None
+    test_p, meta = load_and_predict(var_dir, X_test_orig, arch, device, log)
+    vinfo = verify_split(gt, test_idx, var_dir, test_p, log)
+    am = compute_metrics(y_test, test_p)
+    arap = am.get("recall_at_precision", {})
+    kind = _aug_kind(meta.get("use_augs", ""))
+    d = vinfo["pred_max_abs_diff"]
+    row = {
+        "model": label, "split": split_name, "aug_kind": kind,
+        "source": "ORIGINAL (load+predict)", "orig_dir": str(var_dir),
+        "orig_use_augs": meta.get("use_augs", "?"),
+        "n_test": am["n"], "n_pos": am["n_pos"], "n_neg": am["n_neg"],
+        "best_f1": round(am["best_f1"]["f1"], 4),
+        "best_thr": round(am["best_f1"]["threshold"], 3),
+        "auc": round(am["auc"], 4), "ap": round(am["ap"], 4),
+        "recall@p80": round(_rp(arap, "p80"), 4),
+        "recall@p85": round(_rp(arap, "p85"), 4),
+        "recall@p90": round(_rp(arap, "p90"), 4),
+        "recall@p95": round(_rp(arap, "p95"), 4),
+        "test_groups_match_orig": vinfo["test_groups_match"],
+        "pred_max_abs_diff": (round(d, 8) if d == d else float("nan")),
+    }
+    log.info("[%s/%s] ANCHOR kind=%s: best_f1=%.4f auc=%.3f r@p90=%.4f r@p95=%.4f",
+             label, split_name, kind, am["best_f1"]["f1"], am["auc"],
+             _rp(arap, "p90"), _rp(arap, "p95"))
+    return row
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--data_dir", required=True)
@@ -164,15 +215,22 @@ def main() -> int:
                     help="embeddings_cache.npz (defaults to <data_dir>/embeddings_cache.npz)")
     ap.add_argument("--runs_root", default="/home/ubuntu/nn/runs",
                     help="folder holding the original run dirs")
+    # primary (finalised) run dirs -- anchored under whatever use_augs they used
     ap.add_argument("--m1_a6_dir", default="m1_casual_a6")
     ap.add_argument("--m1_20pct_dir", default="m1_casual_20pct")
     ap.add_argument("--m2_a6_dir", default="m2_nocasual_a6")
     ap.add_argument("--m2_20pct_dir", default="m2_nocasual_20pct")
+    # optional separately-trained NO-AUG runs -- anchored as the 'none' baseline.
+    # leave empty if you don't have no-aug exported runs.
+    ap.add_argument("--m1_a6_none_dir", default="")
+    ap.add_argument("--m1_20pct_none_dir", default="")
+    ap.add_argument("--m2_a6_none_dir", default="")
+    ap.add_argument("--m2_20pct_none_dir", default="")
     ap.add_argument("--seeds", default="42,43,44,45,46",
-                    help="comma-separated TRAINING seeds for the fresh ablation rows")
+                    help="comma-separated TRAINING seeds for the fresh ablation rows; "
+                         "the FIRST seed is the one shown in the 1-seed sheet")
     ap.add_argument("--split_seed", type=int, default=42,
-                    help="must match the original run's --seed (default 42) so the "
-                         "candidate partition is identical")
+                    help="must match the original run's --seed (default 42)")
     ap.add_argument("--min_duration", type=float, default=30.0,
                     help="must match the original run's --min_duration (default 30)")
     ap.add_argument("--batch_size", type=int, default=64)
@@ -185,6 +243,7 @@ def main() -> int:
     args = ap.parse_args()
 
     seeds = [int(s) for s in args.seeds.split(",") if s.strip()]
+    one_seed = seeds[0]
     data_dir = Path(args.data_dir)
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -193,18 +252,20 @@ def main() -> int:
 
     log = setup_logging(out_dir / "log_ablation2.txt", name="ablation2")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    log.info("device=%s seeds=%s split_seed=%d min_duration=%.1f",
-             device, seeds, args.split_seed, args.min_duration)
+    log.info("device=%s seeds=%s (1-seed sheet uses %d) split_seed=%d min_duration=%.1f",
+             device, seeds, one_seed, args.split_seed, args.min_duration)
 
     models = [
         {"label": "m1_default_last_pca98_casual", "arch": "default",
          "layer": "last", "pca": 0.98, "train_only": ["casual"],
          "variant": "default_last_pca98",
-         "orig_dirs": {"20pct": args.m1_20pct_dir, "a6": args.m1_a6_dir}},
+         "primary": {"20pct": args.m1_20pct_dir, "a6": args.m1_a6_dir},
+         "none": {"20pct": args.m1_20pct_none_dir, "a6": args.m1_a6_none_dir}},
         {"label": "m2_tiny_l9_pca95", "arch": "tiny",
          "layer": _l9(), "pca": 0.95, "train_only": [],
          "variant": "tiny_l9_pca95",
-         "orig_dirs": {"20pct": args.m2_20pct_dir, "a6": args.m2_a6_dir}},
+         "primary": {"20pct": args.m2_20pct_dir, "a6": args.m2_a6_dir},
+         "none": {"20pct": args.m2_20pct_none_dir, "a6": args.m2_a6_none_dir}},
     ]
     split_protocols = [
         {"name": "20pct", "test_batches": None},
@@ -270,44 +331,24 @@ def main() -> int:
             log.info("[%s] split frozen: train=%d val=%d test=%d",
                      tag0, len(train_idx), len(val_idx), len(test_idx))
 
-            # ---- ANCHOR: load the original model, predict, verify ----
-            var_dir = runs_root / mspec["orig_dirs"][split_name] / mspec["variant"]
+            # ---- ANCHORS: primary (finalised) + optional no-aug, load+predict
             y_test = y_full[test_idx]
-            if (var_dir / "model.pt").exists():
-                X_test_orig = X_by_aug["orig"][test_idx]
-                test_p, meta = load_and_predict(var_dir, X_test_orig, arch, device, log)
-                vinfo = verify_split(gt, test_idx, var_dir, test_p, log)
-                am = compute_metrics(y_test, test_p)
-                arap = am.get("recall_at_precision", {})
-                anchor_rows.append({
-                    "model": label, "split": split_name, "source": "ORIGINAL (load+predict)",
-                    "orig_dir": str(var_dir),
-                    "orig_use_augs": meta.get("use_augs", "?"),
-                    "n_test": am["n"], "n_pos": am["n_pos"], "n_neg": am["n_neg"],
-                    "best_f1": round(am["best_f1"]["f1"], 4),
-                    "best_thr": round(am["best_f1"]["threshold"], 3),
-                    "auc": round(am["auc"], 4), "ap": round(am["ap"], 4),
-                    "recall@p80": round(_rp(arap, "p80"), 4),
-                    "recall@p85": round(_rp(arap, "p85"), 4),
-                    "recall@p90": round(_rp(arap, "p90"), 4),
-                    "recall@p95": round(_rp(arap, "p95"), 4),
-                    "test_groups_match_orig": vinfo["test_groups_match"],
-                    "pred_max_abs_diff": (round(vinfo["pred_max_abs_diff"], 8)
-                                          if vinfo["pred_max_abs_diff"] == vinfo["pred_max_abs_diff"]
-                                          else float("nan")),
-                })
-                log.info("[%s] ANCHOR (original): best_f1=%.4f auc=%.3f "
-                         "recall@p90=%.4f recall@p95=%.4f",
-                         tag0, am["best_f1"]["f1"], am["auc"],
-                         _rp(arap, "p90"), _rp(arap, "p95"))
-            else:
-                log.error("[%s] no model.pt at %s -- skipping anchor. Re-run the "
-                          "original command with --export_artifacts true.", tag0, var_dir)
-                anchor_rows.append({
-                    "model": label, "split": split_name, "source": "MISSING model.pt",
-                    "orig_dir": str(var_dir)})
+            X_test_orig = X_by_aug["orig"][test_idx]
+            primary_dir = runs_root / mspec["primary"][split_name] / mspec["variant"]
+            r = anchor_one(primary_dir, label, split_name, X_test_orig, y_test,
+                           arch, device, gt, test_idx, log)
+            if r:
+                anchor_rows.append(r)
+            none_name = mspec["none"][split_name]
+            if none_name:
+                none_dir = runs_root / none_name / mspec["variant"]
+                r = anchor_one(none_dir, label, split_name, X_test_orig, y_test,
+                               arch, device, gt, test_idx, log)
+                if r:
+                    r["aug_kind"] = "none"  # this dir is the no-aug baseline
+                    anchor_rows.append(r)
 
-            # ---- fresh ablation on the frozen split (5-seed mean) ----
+            # ---- fresh ablation on the frozen split (per-seed rows) ----
             def eval_config(use_augs: list[str], cfg_name: str, phase: str
                             ) -> tuple[float, float, float]:
                 Xtr, ytr, Xva, Xte = build_xy(
@@ -398,23 +439,32 @@ def main() -> int:
     raw.to_csv(out_dir / "aug_ablation2_raw.csv", index=False)
     log.info("wrote anchor (%d rows) + raw (%d rows)", len(anchor), len(raw))
 
-    summary = pd.DataFrame()
     loo_raw = raw[raw["phase"] == "loo"] if ("phase" in raw.columns and len(raw)) else raw.iloc[0:0]
+
+    # 5-seed mean and 1-seed (seed 42) replication -- SEPARATE sheets.
+    summary_5 = pd.DataFrame()
+    summary_1 = pd.DataFrame()
     if len(loo_raw):
-        summary = _summarise(loo_raw)
-        summary = _attach_anchor_delta(summary, anchor)
-        summary.to_csv(out_dir / "aug_ablation2_summary.csv", index=False)
-        log.info("wrote aug_ablation2_summary.csv")
-        for (model, split), g in summary.groupby(["model", "split"], sort=False):
-            log.info("=" * 70)
-            log.info("LOO2  model=%s split=%s  (fresh 5-seed mean vs ORIGINAL anchor)",
-                     model, split)
-            cols = ["aug_config", "mean_test_best_f1", "delta_test_best_f1",
-                    "mean_test_recall@p90", "delta_test_recall@p90"]
-            cols += [c for c in ("anchor_recall@p90", "delta_recall@p90_vs_anchor")
-                     if c in g.columns]
-            log.info("\n%s", g.sort_values("delta_test_best_f1")[
-                [c for c in cols if c in g.columns]].to_string(index=False))
+        summary_5 = _attach_anchor_delta(_summarise(loo_raw), anchor)
+        summary_5.to_csv(out_dir / "aug_ablation2_summary_5seed.csv", index=False)
+        loo_1 = loo_raw[loo_raw["seed"] == one_seed]
+        if len(loo_1):
+            summary_1 = _attach_anchor_delta(_summarise(loo_1), anchor)
+            summary_1.to_csv(out_dir / "aug_ablation2_summary_1seed.csv", index=False)
+        log.info("wrote summary_5seed (%d rows) + summary_1seed (%d rows)",
+                 len(summary_5), len(summary_1))
+        for title, summ in (("5-SEED MEAN", summary_5),
+                            (f"1-SEED (s{one_seed}) REPLICATION", summary_1)):
+            if not len(summ):
+                continue
+            for (model, split), g in summ.groupby(["model", "split"], sort=False):
+                log.info("=" * 70)
+                log.info("LOO2 %s  model=%s split=%s", title, model, split)
+                cols = ["aug_config", "mean_test_best_f1", "delta_test_best_f1",
+                        "mean_test_recall@p90", "delta_test_recall@p90",
+                        "anchor_all_recall@p90", "delta_recall@p90_vs_anchor"]
+                log.info("\n%s", g.sort_values("delta_test_best_f1")[
+                    [c for c in cols if c in g.columns]].to_string(index=False))
 
     gp = pd.DataFrame(path_rows)
     if len(gp):
@@ -426,8 +476,10 @@ def main() -> int:
     try:
         with pd.ExcelWriter(xlsx_path, engine="openpyxl") as xw:
             anchor.to_excel(xw, sheet_name="anchor_original", index=False)
-            if len(summary):
-                summary.to_excel(xw, sheet_name="loo_summary", index=False)
+            if len(summary_5):
+                summary_5.to_excel(xw, sheet_name="loo_summary_5seed", index=False)
+            if len(summary_1):
+                summary_1.to_excel(xw, sheet_name="loo_summary_1seed", index=False)
             if len(gp):
                 gp.to_excel(xw, sheet_name="greedy_path", index=False)
             if len(raw):
@@ -438,32 +490,52 @@ def main() -> int:
                     "pip install openpyxl to enable the workbook.", e, out_dir)
 
     log.info("=" * 70)
-    log.info("READING: 'anchor_original' = exact headline numbers reproduced by "
-             "loading the original weights. loo_summary delta_test_best_f1 is vs "
-             "the FRESH 5-seed 'all'; delta_*_vs_anchor is vs the ORIGINAL model. "
-             "An aug HELPS if dropping it lowers test (negative delta beyond seed std).")
+    log.info("READING: anchor_original = exact headline numbers reproduced by "
+             "loading the original weights (pred_max_abs_diff ~0 + "
+             "test_groups_match_orig=YES => faithful). loo_summary_5seed = honest "
+             "init-luck-averaged estimate; loo_summary_1seed = single seed-42 "
+             "draw, closest to how the headline number was made. delta_*_vs_anchor "
+             "compares the fresh config to the ORIGINAL model. An aug HELPS if "
+             "dropping it lowers test (negative delta beyond the seed std).")
     return 0
 
 
 def _attach_anchor_delta(summary: pd.DataFrame, anchor: pd.DataFrame) -> pd.DataFrame:
-    """Add the ORIGINAL anchor's best_f1 + recall@p{80,85,90,95} to every row,
-    plus delta of the fresh config vs that true anchor."""
+    """Attach the ORIGINAL anchors' metrics (all + none, whichever were loaded)
+    to every summary row, plus delta of each fresh config vs the matching
+    anchor: aug_config 'all' -> all-anchor, 'none' -> none-anchor, others ->
+    all-anchor (the baseline the LOO removes augs from)."""
+    out = summary.copy().reset_index(drop=True)
     if not len(anchor) or "best_f1" not in anchor.columns:
-        return summary
-    a = anchor.set_index(["model", "split"])
-    rp = ["recall@p80", "recall@p85", "recall@p90", "recall@p95"]
-    out = summary.copy()
-    for col in ["best_f1"] + rp:
-        out[f"anchor_{col}"] = [
-            float(a.loc[(m, s), col]) if (m, s) in a.index and col in a.columns
-            else float("nan")
-            for m, s in zip(out["model"], out["split"])]
-    # delta of fresh config vs the original anchor (only meaningful for f1 + rp)
-    out["delta_f1_vs_anchor"] = (out["mean_test_best_f1"] - out["anchor_best_f1"]).round(4)
-    for k in rp:
+        return out
+    metrics = ["best_f1"] + _RP_KEYS
+    # (model, split, kind) -> row
+    idx = {(r["model"], r["split"], r["aug_kind"]): r
+           for _, r in anchor.iterrows() if "aug_kind" in r}
+    for kind in ("all", "none"):
+        for col in metrics:
+            out[f"anchor_{kind}_{col}"] = [
+                float(idx[(m, s, kind)][col]) if (m, s, kind) in idx else float("nan")
+                for m, s in zip(out["model"], out["split"])]
+
+    def _anchor_kind_for(cfg: str) -> str:
+        return "none" if cfg == "none" else "all"
+
+    # delta of fresh config vs its matching original anchor
+    out["delta_best_f1_vs_anchor"] = [
+        round(mf1 - out.loc[i, f"anchor_{_anchor_kind_for(cfg)}_best_f1"], 4)
+        if out.loc[i, f"anchor_{_anchor_kind_for(cfg)}_best_f1"] ==
+           out.loc[i, f"anchor_{_anchor_kind_for(cfg)}_best_f1"] else float("nan")
+        for i, (cfg, mf1) in enumerate(zip(out["aug_config"], out["mean_test_best_f1"]))]
+    for k in _RP_KEYS:
         mc = f"mean_test_{k}"
-        if mc in out.columns:
-            out[f"delta_{k}_vs_anchor"] = (out[mc] - out[f"anchor_{k}"]).round(4)
+        if mc not in out.columns:
+            continue
+        out[f"delta_{k}_vs_anchor"] = [
+            round(mv - out.loc[i, f"anchor_{_anchor_kind_for(cfg)}_{k}"], 4)
+            if out.loc[i, f"anchor_{_anchor_kind_for(cfg)}_{k}"] ==
+               out.loc[i, f"anchor_{_anchor_kind_for(cfg)}_{k}"] else float("nan")
+            for i, (cfg, mv) in enumerate(zip(out["aug_config"], out[mc]))]
     return out
 
 
