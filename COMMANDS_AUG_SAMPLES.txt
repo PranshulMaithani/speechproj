@@ -68,6 +68,59 @@ READING:
           held-out estimate (selection was on val).
 
 ================================================================================
+A2) ABLATION ANCHORED TO THE ORIGINAL MODELS   (ec2/aug_ablation2.py)
+================================================================================
+Why: aug_ablation.py 5-seed-averages EVERY config incl 'all', so its 'all' is a
+FRESH estimate -- it does NOT reproduce the headline sheet (that was one run,
+one training-luck draw). That is the 48->30 gap on M2/a6: same candidates,
+different init luck.
+
+aug_ablation2.py LOADS the original exported weights for each model x protocol
+(model.pt + scaler.joblib + pca.joblib) and PREDICTS on the test rows -> the
+'anchor_original' row is the EXACT headline number (M2/a6 recall@p90 = 0.48),
+by real inference, not a CSV copy. It first PROVES the frozen split's test
+candidates == the original predictions.csv group_ids, and that the
+reconstructed pred_score == the saved pred_score (max|diff| < 1e-3). Then it
+runs the same LOO + greedy ablation on that identical split.
+
+Needs the 4 original runs with exported artifacts present:
+  runs/m1_casual_a6/default_last_pca98/{model.pt,scaler.joblib,pca.joblib,...}
+  runs/m1_casual_20pct/default_last_pca98/...
+  runs/m2_nocasual_a6/tiny_l9_pca95/...
+  runs/m2_nocasual_20pct/tiny_l9_pca95/...
+(seed 42 + min_duration 30 were the original defaults -> split reproduces.)
+
+RUN:
+python ec2/aug_ablation2.py \
+    --data_dir   /home/ubuntu/nn/data \
+    --cache      /home/ubuntu/nn/data/embeddings_cache.npz \
+    --out_dir    /home/ubuntu/nn/runs/aug_ablation2 \
+    --runs_root  /home/ubuntu/nn/runs \
+    --seeds 42,43,44,45,46 \
+    --mode both
+# override dir names if different: --m1_a6_dir / --m1_20pct_dir /
+#                                  --m2_a6_dir / --m2_20pct_dir
+
+OUTPUTS (in --out_dir):
+  aug_ablation2.xlsx        sheets: anchor_original | loo_summary | greedy_path | raw
+  aug_ablation2_anchor.csv  EXACT original metrics (load+predict) + verify cols:
+                            test_groups_match_orig (YES = same candidates),
+                            pred_max_abs_diff (<1e-3 = faithful reproduction)
+  aug_ablation2_summary.csv LOO mean/std + delta vs fresh 'all' AND vs the
+                            ORIGINAL anchor (delta_*_vs_anchor / anchor_recall@p90)
+  aug_ablation2_raw.csv     per (model,split,aug_config,seed) fresh-run rows
+  aug_greedy2_path.csv      greedy forward-selection path
+
+READING:
+  * anchor_original  = the real headline number, reproduced. If pred_max_abs_diff
+    is ~0 and test_groups_match_orig=YES, the load->predict path is exact.
+  * loo_summary delta_test_best_f1 = vs the FRESH 5-seed 'all' (clean aug effect,
+    init-luck removed). delta_*_vs_anchor = vs the ORIGINAL single model (shows
+    how much of the headline number was training luck vs augmentation).
+  * NOTE: there is no original 'none' (the sheet was all-aug), so 'none' is a
+    fresh-trained floor only -- it has no anchor counterpart.
+
+================================================================================
 B)  LISTEN TO THE AUGMENTATIONS   (2 scripts, npy -> wav only locally)
 ================================================================================
 PII boundary:
