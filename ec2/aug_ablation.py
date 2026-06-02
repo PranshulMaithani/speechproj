@@ -37,9 +37,13 @@ Modes (--mode):
   both    run loo then greedy.
 
 Outputs (in --out_dir):
-  aug_ablation_raw.csv      one row per (model, split, phase, aug_config, seed)
+  aug_ablation_raw.csv      one row per (model, split, phase, aug_config, seed);
+                            includes test_recall@p80/85/90/95 (recall at fixed
+                            precision -- the operating points that move between
+                            no-aug and all-aug even when f1/auc barely change)
   aug_ablation_summary.csv  LOO only: per (model, split, aug_config) mean/std of
-                            test F1 + val F1, delta vs 'all', verdict
+                            test F1 + val F1, delta vs 'all', verdict, AND
+                            mean + delta_vs_all for recall@p80/85/90/95
   aug_greedy_path.csv       greedy only: the forward-selection path (step,
                             chosen_aug, selected_set, mean val/test F1)
 
@@ -246,6 +250,13 @@ def main() -> int:
                     m = result.test_metrics
                     vfs.append(result.best_val_f1)
                     tfs.append(m["best_f1"]["f1"])
+                    rap = m.get("recall_at_precision", {})
+
+                    def _rp(k: str) -> float:
+                        v = rap.get(k, {})
+                        return v.get("recall", float("nan")) if isinstance(v, dict) \
+                            else float("nan")
+
                     raw_rows.append({
                         "model": label, "split": split_name, "phase": phase,
                         "aug_config": cfg_name, "n_augs": len(use_augs),
@@ -256,6 +267,13 @@ def main() -> int:
                         "test_best_thr": round(m["best_f1"]["threshold"], 3),
                         "test_auc": round(m["auc"], 4),
                         "test_ap": round(m["ap"], 4),
+                        # recall at fixed precision -- the operating points that
+                        # actually move between no-aug and all-aug even when
+                        # f1/auc barely change.
+                        "test_recall@p80": round(_rp("p80"), 4),
+                        "test_recall@p85": round(_rp("p85"), 4),
+                        "test_recall@p90": round(_rp("p90"), 4),
+                        "test_recall@p95": round(_rp("p95"), 4),
                         "n_test": m["n"],
                     })
                     log.info("[%s] val_f1=%.4f test_best_f1=%.4f f1@.5=%.4f auc=%.3f",
@@ -327,9 +345,14 @@ def main() -> int:
             log.info("LOO ABLATION  model=%s  split=%s  (test_best_f1, mean over %d seeds)",
                      model, split, len(seeds))
             g = g.sort_values("delta_test_best_f1")
-            log.info("\n%s", g[[
-                "aug_config", "mean_test_best_f1", "std_test_best_f1",
-                "delta_test_best_f1", "mean_val_f1", "verdict"]].to_string(index=False))
+            cols = ["aug_config", "mean_test_best_f1", "std_test_best_f1",
+                    "delta_test_best_f1", "mean_val_f1"]
+            for extra in ("mean_test_recall@p90", "delta_test_recall@p90",
+                          "mean_test_recall@p95", "delta_test_recall@p95"):
+                if extra in g.columns:
+                    cols.append(extra)
+            cols.append("verdict")
+            log.info("\n%s", g[cols].to_string(index=False))
         log.info("=" * 70)
         log.info("LOO READING: 'drop_X' with NEGATIVE delta => removing X hurt => "
                  "X HELPS. POSITIVE delta => removing X helped => X HURTS. Only "
@@ -357,6 +380,8 @@ def main() -> int:
 def _summarise(raw: pd.DataFrame) -> pd.DataFrame:
     rows = []
     for (model, split), g in raw.groupby(["model", "split"], sort=False):
+        rp_cols = ["test_recall@p80", "test_recall@p85",
+                   "test_recall@p90", "test_recall@p95"]
         agg = g.groupby("aug_config", sort=False).agg(
             n_augs=("n_augs", "first"),
             mean_test_best_f1=("test_best_f1", "mean"),
@@ -365,10 +390,14 @@ def _summarise(raw: pd.DataFrame) -> pd.DataFrame:
             mean_val_f1=("val_f1", "mean"),
             std_val_f1=("val_f1", "std"),
             mean_test_auc=("test_auc", "mean"),
+            **{f"mean_{c}": (c, "mean") for c in rp_cols if c in g.columns},
         ).reset_index()
         base = agg.loc[agg["aug_config"] == "all"]
         base_f1 = float(base["mean_test_best_f1"].iloc[0]) if len(base) else float("nan")
         base_std = float(base["std_test_best_f1"].iloc[0]) if len(base) else float("nan")
+        base_rp = {c: (float(base[f"mean_{c}"].iloc[0])
+                       if (len(base) and f"mean_{c}" in base.columns) else float("nan"))
+                   for c in rp_cols}
         for _, r in agg.iterrows():
             delta = r["mean_test_best_f1"] - base_f1
             # significant only if the move beats the baseline seed wobble
@@ -381,7 +410,7 @@ def _summarise(raw: pd.DataFrame) -> pd.DataFrame:
                 verdict = "HELPS (removing hurt)"
             else:
                 verdict = "HURTS (removing helped)"
-            rows.append({
+            row = {
                 "model": model, "split": split,
                 "aug_config": r["aug_config"], "n_augs": int(r["n_augs"]),
                 "mean_test_best_f1": round(r["mean_test_best_f1"], 4),
@@ -392,7 +421,15 @@ def _summarise(raw: pd.DataFrame) -> pd.DataFrame:
                 "std_val_f1": round(r["std_val_f1"], 4),
                 "mean_test_auc": round(r["mean_test_auc"], 4),
                 "verdict": verdict,
-            })
+            }
+            # recall@precision means + deltas vs 'all' -- where the no-aug vs
+            # all-aug difference actually shows up.
+            for c in rp_cols:
+                mc = f"mean_{c}"
+                if mc in agg.columns:
+                    row[mc] = round(r[mc], 4)
+                    row[f"delta_{c}"] = round(r[mc] - base_rp[c], 4)
+            rows.append(row)
     return pd.DataFrame(rows)
 
 
