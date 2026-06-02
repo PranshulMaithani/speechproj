@@ -79,14 +79,25 @@ def _rp(rap: dict, k: str) -> float:
     return v.get("recall", float("nan")) if isinstance(v, dict) else float("nan")
 
 
-def _aug_kind(use_augs: str) -> str:
-    """Normalise a run's --use_augs string to the ablation config it anchors."""
-    s = (use_augs or "").strip().lower()
-    if s in ("", "none"):
+def _aug_kind(use_augs, all_augs: list[str]) -> str:
+    """Normalise a run's use_augs (inference_meta.json stores it as a LIST, but
+    older/str forms are tolerated) to the ablation config it anchors:
+    [] -> 'none', the full aug set -> 'all', anything else -> the joined subset."""
+    if isinstance(use_augs, str):
+        s = use_augs.strip().lower()
+        if s in ("", "none"):
+            items: list[str] = []
+        elif s == "all":
+            items = list(all_augs)
+        else:
+            items = [x.strip() for x in s.split(",") if x.strip()]
+    else:  # list / tuple as written by extract -> resolve_use_augs
+        items = [str(x) for x in (use_augs or [])]
+    if not items:
         return "none"
-    if s == "all":
+    if set(items) == set(all_augs):
         return "all"
-    return s  # an explicit subset -- anchored under its own label
+    return "+".join(sorted(items))
 
 
 @torch.no_grad()
@@ -173,7 +184,8 @@ def verify_split(gt: pd.DataFrame, test_idx: np.ndarray, var_dir: Path,
 
 def anchor_one(var_dir: Path, label: str, split_name: str, X_test_orig: np.ndarray,
                y_test: np.ndarray, arch: dict, device: torch.device,
-               gt: pd.DataFrame, test_idx: np.ndarray, log) -> dict | None:
+               gt: pd.DataFrame, test_idx: np.ndarray, all_augs: list[str],
+               log) -> dict | None:
     """Load one exported original model, predict, verify, return an anchor row
     (labelled by its actual use_augs). None if model.pt is absent."""
     if not (var_dir / "model.pt").exists():
@@ -184,7 +196,7 @@ def anchor_one(var_dir: Path, label: str, split_name: str, X_test_orig: np.ndarr
     vinfo = verify_split(gt, test_idx, var_dir, test_p, log)
     am = compute_metrics(y_test, test_p)
     arap = am.get("recall_at_precision", {})
-    kind = _aug_kind(meta.get("use_augs", ""))
+    kind = _aug_kind(meta.get("use_augs", ""), all_augs)
     d = vinfo["pred_max_abs_diff"]
     row = {
         "model": label, "split": split_name, "aug_kind": kind,
@@ -336,14 +348,14 @@ def main() -> int:
             X_test_orig = X_by_aug["orig"][test_idx]
             primary_dir = runs_root / mspec["primary"][split_name] / mspec["variant"]
             r = anchor_one(primary_dir, label, split_name, X_test_orig, y_test,
-                           arch, device, gt, test_idx, log)
+                           arch, device, gt, test_idx, all_augs, log)
             if r:
                 anchor_rows.append(r)
             none_name = mspec["none"][split_name]
             if none_name:
                 none_dir = runs_root / none_name / mspec["variant"]
                 r = anchor_one(none_dir, label, split_name, X_test_orig, y_test,
-                               arch, device, gt, test_idx, log)
+                               arch, device, gt, test_idx, all_augs, log)
                 if r:
                     r["aug_kind"] = "none"  # this dir is the no-aug baseline
                     anchor_rows.append(r)
