@@ -139,6 +139,51 @@ READING:
     and pass its dir via --*_none_dir.
 
 ================================================================================
+A3) IN-SWEEP ABLATION THAT REPRODUCES THE HEADLINE NUMBER
+    (ec2/neural_baseline_ablation.py -- a copy of neural_baseline_train.py)
+================================================================================
+Use this when you need the single-seed 'all' number to EXACTLY match your sheet
+(e.g. M2/a6 recall@p90 = 0.48). aug_ablation2.py reseeds per config so it cannot
+hit that number; this script runs the FULL original sweep so the RNG state at
+the target variant is the exact headline state, then ablates from there.
+
+How it works:
+  * Runs the 30-variant sweep byte-identically (so every headline number repros).
+  * When it reaches a --ablate_variants target, it snapshots the pre-train RNG,
+    trains 'all' (== the sheet number) and each drop_<aug>/none from that SAME
+    state, then restores the post-train RNG so later variants stay identical.
+  * 'all' shares the headline init, so drop_<aug> deltas are a pure aug effect.
+
+CRITICAL: run it with the SAME command/flags as that variant's ORIGINAL run, or
+the RNG path differs and 'all' won't reproduce. The original flags are logged at
+the top of runs/<orig_dir>/log_nn.txt. Just swap the script name, point --out_dir
+somewhere new, and add --ablate_variants.
+
+RUN (M2 on a6 -- mirrors the m2_nocasual_a6 command; keep --use_augs/--seed/
+--train_only_batches/--test_batches/--min_duration EXACTLY as the original):
+python ec2/neural_baseline_ablation.py \
+    --data_dir /home/ubuntu/nn/data \
+    --cache    /home/ubuntu/nn/data/embeddings_cache.npz \
+    --out_dir  /home/ubuntu/nn/runs/m2_nocasual_a6_ablation \
+    --test_batches audios6 \
+    --min_duration 30 \
+    --use_augs all \
+    --ablate_variants tiny_l9_pca95
+# M2 20pct: drop --test_batches.   M1 runs: use the m1_casual command (it adds
+# casual via --train_only_batches) and --ablate_variants default_last_pca98.
+
+OUTPUTS (in --out_dir):
+  summary1.csv         the full 30-variant sweep (its tiny_l9_pca95 row should
+                       equal your original m2_nocasual_a6 sheet row)
+  ablation_sweep.csv   per (variant, aug_config): test_best_f1, recall@p80..95,
+                       + delta_*_vs_all (vs that variant's own 'all' = headline)
+  ablation_sweep.xlsx  sheets: ablation | sweep_summary
+
+VERIFY: the ablation 'all' row == summary1.csv tiny_l9_pca95 == your sheet. If
+yes, the drop_<aug>/none rows are trustworthy single-seed comparisons at the
+exact operating point of the headline model.
+
+================================================================================
 B)  LISTEN TO THE AUGMENTATIONS   (2 scripts, npy -> wav only locally)
 ================================================================================
 PII boundary:
