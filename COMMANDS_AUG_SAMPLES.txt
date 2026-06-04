@@ -169,8 +169,11 @@ python ec2/neural_baseline_ablation.py \
     --min_duration 30 \
     --use_augs all \
     --ablate_variants tiny_l9_pca95
-# M2 20pct: drop --test_batches.   M1 runs: use the m1_casual command (it adds
-# casual via --train_only_batches) and --ablate_variants default_last_pca98.
+# M2 20pct: drop --test_batches.
+# NOTE: this ablation copy defaults --train_only_batches to EMPTY (nothing
+# auxiliary added unless asked). So M1 runs must pass casual explicitly:
+#   --train_only_batches casual --ablate_variants default_last_pca98
+# (ALLSTAR is never added unless you pass --train_only_batches 2676,2677.)
 
 OUTPUTS (in --out_dir):
   summary1.csv         the full 30-variant sweep (its tiny_l9_pca95 row should

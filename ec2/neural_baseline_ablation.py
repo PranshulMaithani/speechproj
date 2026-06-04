@@ -359,14 +359,20 @@ def main() -> int:
     ap.add_argument("--out_dir", required=True)
     ap.add_argument("--cache", default="",
                     help="path to embeddings_cache.npz. Defaults to <data_dir>/embeddings_cache.npz.")
-    ap.add_argument("--train_batches", default="audios2,audios4,audios5,audios6,2676,2677")
+    ap.add_argument("--train_batches", default="audios2,audios4,audios5,audios6",
+                    help="batches eligible for train/val/test. ALLSTAR (2676,2677) "
+                         "is NOT included by default in this ablation copy -- add "
+                         "it explicitly only if you want it.")
     ap.add_argument("--test_batches", default="",
                     help="empty -> 60/20/20 candidate-wise split on train_batches")
     ap.add_argument("--test_region_filter", default="",
                     help="when test_batches set, restrict test to region == this")
-    ap.add_argument("--train_only_batches", default="2676,2677",
+    ap.add_argument("--train_only_batches", default="",
                     help="comma-separated batches whose rows are forced into train "
-                         "only -- never appear in val/test. Default: ALLSTAR batches.")
+                         "only -- never appear in val/test. EMPTY by default in "
+                         "this ablation copy: nothing auxiliary is added unless you "
+                         "ask for it (e.g. --train_only_batches casual, or 2676,2677 "
+                         "for ALLSTAR).")
     ap.add_argument("--min_duration", type=float, default=0.0,
                     help="drop rows with duration_sec < this from BOTH train and test")
     ap.add_argument("--use_augs", default="",
