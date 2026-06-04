@@ -135,12 +135,14 @@ python ec2/build_analysis_excel.py \
     --out /home/ubuntu/nn/runs/analysis_2models.xlsx
 
 --------------------------------------------------------------------------------
-RESULTING WORKBOOK  (6 sheets)
+RESULTING WORKBOOK  (14 sheets: 3 originals + 4 stability, per each of 2 models)
 --------------------------------------------------------------------------------
   m1_default_last_pca98_casual_pred    per-file preds (mercer + casual rows)
   m1_default_last_pca98_casual_sweep   threshold sweep, all rows       (orig only)
   m1_default_last_pca98_casual_sweepT  threshold sweep, TEST + VAL rows (orig only)
-  m2_tiny_l9_pca95_pred / _sweep / _sweepT
+  m1..._a6test_sh / _a6val_sh / _20test_sh / _20val_sh   threshold STABILITY
+  m2_tiny_l9_pca95_pred / _sweep / _sweepT / _a6test_sh / _a6val_sh /
+                          _20test_sh / _20val_sh
 
 Sheet 1 columns:
   Filename | real_id (blank for VLOOKUP) | GT (yes/no) | region (IND/PHP/CASUAL/UNK)
@@ -176,6 +178,21 @@ SweepT columns (_sweepT, TEST + VAL side by side, both protocols):
   split20_val) at each threshold: if val and test confusion track each other,
   the chosen operating threshold generalises; if they diverge, the threshold
   is overfit to one split.
+
+Stability columns (_a6test_sh / _a6val_sh / _20test_sh / _20val_sh):
+  SAME trained model, NO retraining. The held-out pool for that protocol
+  (its val+test rows) is re-drawn candidate-wise into new val/test 5 times:
+  block 'orig' = the real partition (reproduces sweepT), then s2..s5 = 4
+  reshuffles (seeds 43-46) keeping the SAME candidate counts. Columns:
+    threshold
+    | orig_tp orig_fp orig_tn orig_fn orig_prec orig_rec     <- real partition
+    | s2_tp ... s2_rec  | s3_... | s4_... | s5_...            <- 4 reshuffles
+    | mean_prec std_prec mean_rec std_rec                     <- across 5 draws
+  (101 rows; ORIG predictions only). Read a row across the 5 draws: small std =
+  the threshold's precision/recall is stable (not a fluke of one val/test
+  split); large std = that operating point swings with the sample. Train rows
+  are never included, so there is no leakage -- only which HELD-OUT candidates
+  are called val vs test changes.
 
 --------------------------------------------------------------------------------
 "WHY IS THE TRAIN SET 0 FALSE PREDICTIONS?"  (overfitting check)

@@ -21,7 +21,19 @@ For EACH model (2 total) it writes 3 sheets:
                    a6 {fp,fn,tp,tn,prec,recall} | a6_val {...} |
                    split20 {...} | split20_val {...}
                    -> compare how val tracks test at each threshold.
-=> 6 sheets total.
+
+Plus 4 THRESHOLD-STABILITY sheets per model (8 total). SAME trained model, NO
+retraining: for one protocol the held-out pool (its val+test rows) is re-drawn
+candidate-wise into new val/test 5 times -- block 'orig' is the real partition,
+then 4 reshuffles (RESHUFFLE_SEEDS) keeping the same candidate counts. Per
+threshold each draw shows {tp,fp,tn,fn,prec,rec}, then mean & std of prec/recall
+across the 5 draws, so you can tell a stable threshold from a one-split fluke.
+Train rows are never pulled in -> no leakage; only held-out candidates move.
+  <label>_a6test_sh   a6 protocol, the TEST partition across 5 draws
+  <label>_a6val_sh    a6 protocol, the VAL  partition across 5 draws
+  <label>_20test_sh   20% protocol, TEST partition across 5 draws
+  <label>_20val_sh    20% protocol, VAL  partition across 5 draws
+=> 14 sheets total (3 originals + 4 stability, per each of 2 models).
 
 Each model needs TWO runs (same variant, two split protocols):
   --modelN_20pct_run : a Mode-A run (--test_batches "" -> 60/20/20 split)
@@ -174,9 +186,91 @@ def sweep_table_test_val(p20t: np.ndarray, y20t: np.ndarray,
     return pd.DataFrame(rows)
 
 
+# Reshuffle seeds for the threshold-stability sheets. The FIRST block is always
+# the ORIGINAL partition (so it reproduces the sweepT numbers); these 4 seeds add
+# 4 more candidate-wise reshuffles -> 5 columns side by side.
+RESHUFFLE_SEEDS = [43, 44, 45, 46]
+
+
+def _shuffle_block(p: np.ndarray, y: np.ndarray, bid: str) -> pd.DataFrame:
+    """Confusion at every threshold for one val/test draw, columns prefixed bid."""
+    rows = []
+    for t in THRESHOLDS:
+        c = confusion_at(p, y, t)
+        rows.append({"threshold": t,
+                     f"{bid}_tp": c["tp"], f"{bid}_fp": c["fp"],
+                     f"{bid}_tn": c["tn"], f"{bid}_fn": c["fn"],
+                     f"{bid}_prec": c["precision"], f"{bid}_rec": c["recall"]})
+    return pd.DataFrame(rows).set_index("threshold")
+
+
+def shuffle_stability_sheet(pool: pd.DataFrame, split_col: str, pred_col: str,
+                            want: str, group_col: str = "group_id") -> pd.DataFrame:
+    """SAME model, no retraining: take the held-out pool (val+test rows of this
+    protocol), and look at the `want` ('test' or 'val') partition under 5
+    candidate-wise draws -- block 'orig' is the real partition, then 4 reshuffles
+    (RESHUFFLE_SEEDS) of the pool into new val/test of the SAME candidate counts.
+    One row per threshold; per draw {tp,fp,tn,fn,prec,rec} side by side, then
+    mean & std of precision/recall across the 5 draws. Lets you see whether a
+    threshold's precision/recall is stable or a fluke of one val/test split."""
+    g_all = pool[group_col].astype(str).to_numpy()
+    y_all = pool["label"].to_numpy().astype(int)
+    p_all = pool[pred_col].to_numpy().astype(float)
+    groups = pd.unique(g_all)
+    n_test_cand = pool.loc[pool[split_col] == "test", group_col].astype(str).nunique()
+    n_val_cand = pool.loc[pool[split_col] == "val", group_col].astype(str).nunique()
+
+    blocks = []
+    # block 1 = the ORIGINAL partition (reproduces sweepT)
+    orig_mask = (pool[split_col] == want).to_numpy()
+    blocks.append(_shuffle_block(p_all[orig_mask], y_all[orig_mask], "orig"))
+    # blocks 2..5 = candidate-wise reshuffles of the SAME pool
+    bids = ["orig"]
+    for i, seed in enumerate(RESHUFFLE_SEEDS, start=2):
+        rng = np.random.default_rng(seed)
+        gs = groups.copy()
+        rng.shuffle(gs)
+        test_g = set(gs[:n_test_cand])
+        val_g = set(gs[n_test_cand:n_test_cand + n_val_cand])
+        sel = test_g if want == "test" else val_g
+        mask = np.fromiter((g in sel for g in g_all), dtype=bool, count=len(g_all))
+        bid = f"s{i}"
+        bids.append(bid)
+        blocks.append(_shuffle_block(p_all[mask], y_all[mask], bid))
+
+    out = pd.concat(blocks, axis=1).reset_index()
+    prec_cols = [f"{b}_prec" for b in bids]
+    rec_cols = [f"{b}_rec" for b in bids]
+    out["mean_prec"] = out[prec_cols].mean(axis=1, skipna=True).round(4)
+    out["std_prec"] = out[prec_cols].std(axis=1, skipna=True).round(4)
+    out["mean_rec"] = out[rec_cols].mean(axis=1, skipna=True).round(4)
+    out["std_rec"] = out[rec_cols].std(axis=1, skipna=True).round(4)
+    return out
+
+
+def build_shuffle_sheets(m: pd.DataFrame) -> dict[str, pd.DataFrame]:
+    """4 stability sheets for one model: {a6_test, a6_val, 20pct_test, 20pct_val}.
+    Pool = that protocol's held-out (val+test) rows only -- train rows are never
+    pulled in, so there's no leakage; we only resample which held-out candidates
+    are called val vs test."""
+    if "group_id" not in m.columns:
+        m = m.copy()
+        m["group_id"] = m["npy_filename"]  # row-wise fallback (no candidate ids)
+        print("  WARNING: no group_id in dumps -> shuffle is row-wise, not "
+              "candidate-wise", file=sys.stderr)
+    out: dict[str, pd.DataFrame] = {}
+    for proto, split_col, pred_col in (("a6", "split_a6", "pred_prob_a6"),
+                                       ("20pct", "split_20", "pred_prob_20")):
+        pool = m[m[split_col].isin(["val", "test"])].copy()
+        for want in ("test", "val"):
+            out[f"{proto}_{want}"] = shuffle_stability_sheet(
+                pool, split_col, pred_col, want)
+    return out
+
+
 def build_model_sheets(variant: str, run_20pct: Path, run_a6: Path,
-                       ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Returns (pred_sheet, sweep_all, sweep_testonly) for one model."""
+                       ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict]:
+    """Returns (pred_sheet, sweep_all, sweep_testonly, shuffle_sheets) for one model."""
     df20 = _included_only(_load_full_pred(run_20pct, variant))
     dfa6 = _included_only(_load_full_pred(run_a6, variant))
 
@@ -235,10 +329,13 @@ def build_model_sheets(variant: str, run_20pct: Path, run_a6: Path,
         p20[test20], y[test20], p20[val20], y[val20],
         pa6[testa6], y[testa6], pa6[vala6], y[vala6])
 
+    # ---- Sheets 4-7: threshold stability across 5 candidate-wise val/test draws
+    shuffle_sheets = build_shuffle_sheets(m)
+
     print(f"  aug columns: {augs if augs else '(none)'}")
     print(f"  sweepT rows: 20% test={int(test20.sum())} val={int(val20.sum())}  "
           f"a6 test={int(testa6.sum())} val={int(vala6.sum())}")
-    return pred, sweep_all, sweep_test
+    return pred, sweep_all, sweep_test, shuffle_sheets
 
 
 def _safe_sheet_name(name: str, suffix: str) -> str:
@@ -289,15 +386,22 @@ def main() -> int:
             print(f"[{label}] variant={variant}")
             print(f"  20% run: {run20}")
             print(f"  a6  run: {runa6}")
-            pred, sweep_all, sweep_test = build_model_sheets(variant, run20, runa6)
+            pred, sweep_all, sweep_test, shuffle_sheets = build_model_sheets(
+                variant, run20, runa6)
             pred.to_excel(xw, sheet_name=_safe_sheet_name(label, "pred"), index=False)
             sweep_all.to_excel(xw, sheet_name=_safe_sheet_name(label, "sweep"), index=False)
             sweep_test.to_excel(xw, sheet_name=_safe_sheet_name(label, "sweepT"), index=False)
+            # 4 stability sheets per model (8 total across the 2 models)
+            for key, suffix in (("a6_test", "a6test_sh"), ("a6_val", "a6val_sh"),
+                                ("20pct_test", "20test_sh"), ("20pct_val", "20val_sh")):
+                shuffle_sheets[key].to_excel(
+                    xw, sheet_name=_safe_sheet_name(label, suffix), index=False)
             n_test20 = int((pred["split_20%_test"] == "test").sum())
             n_testa6 = int((pred["split_a6_test"] == "test").sum())
-            print(f"  rows={len(pred)}  20%-test={n_test20}  a6-test={n_testa6}")
+            print(f"  rows={len(pred)}  20%-test={n_test20}  a6-test={n_testa6}  "
+                  f"+4 stability sheets")
 
-    print(f"wrote {args.out}  (6 sheets: 3 per model)")
+    print(f"wrote {args.out}  (14 sheets: 3 originals + 4 stability per model)")
     return 0
 
 
