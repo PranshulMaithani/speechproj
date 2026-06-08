@@ -187,6 +187,67 @@ yes, the drop_<aug>/none rows are trustworthy single-seed comparisons at the
 exact operating point of the headline model.
 
 ================================================================================
+A4) MULTI-SEED ARCHITECTURE COMPARISON -- WHICH VARIANT WINS WITHOUT A FLUKE
+    (ec2/neural_baseline_multiseed.py -- sibling of neural_baseline_train.py)
+================================================================================
+Use this when you want to pick the best ARCHITECTURE, not the best lucky run.
+It trains every variant over N seeds and reports mean +/- std per variant. A
+variant with a high mean and low std is genuinely good; a high single-seed score
+with big std was a fluke of the split.
+
+WHY A SEPARATE FILE (reproducibility guarantee differs from the sweep):
+  * neural_baseline_train.py / _ablation.py : ONE global seed; the RNG a variant
+    sees depends on its slot in the sweep -> a single model only reproduces by
+    replaying the whole sweep.
+  * multiseed : every (variant, seed) is SELF-CONTAINED. The split is a function
+    of `seed` alone; the model init/sampler/shuffle is reseeded right before
+    train with model_seed = sha256(seed:variant). So re-running with
+    --seeds <seed> --variants <variant> reproduces that ONE model bit-for-bit
+    (CPU exact, GPU close) without touching anything else. model_seed is recorded
+    in per_run.csv and each metrics.json.
+
+HOW SEEDS SHUFFLE (same --test_batches switch as the base script):
+  * 20pct mode (no --test_batches): each seed reshuffles ALL candidates into new
+    train/val/test (StratifiedGroupKFold(random_state=seed)).
+  * a6 mode (--test_batches audios6): test = audios6 FIXED every seed; only the
+    train/val partition of the non-test pool is reshuffled per seed.
+
+RUN (a6 protocol, fixed audios6 test, 5 seeds):
+python ec2/neural_baseline_multiseed.py \
+    --data_dir /home/ubuntu/nn/data \
+    --cache    /home/ubuntu/nn/data/embeddings_cache.npz \
+    --out_dir  /home/ubuntu/nn/runs/multiseed_a6 \
+    --train_batches audios2,audios4,audios5,audios6 \
+    --test_batches  audios6 \
+    --min_duration 30 \
+    --seeds 42,43,44,45,46
+# 20pct: drop --test_batches (everything reshuffled per seed).
+# Restrict variants: --variants tiny_l9_pca95,default_last_pca98
+# Add aux train rows (never val/test): --train_only_batches casual
+# Save downloadable model files: --export_artifacts true
+
+OUTPUTS (in --out_dir):
+  per_run.csv            one row per (variant, seed): metrics + model_seed +
+                         train/val/test row & candidate counts (the audit trail)
+  summary_mean_std.csv   per variant: <metric>_mean / <metric>_std across seeds,
+                         ranked by test_best_f1_mean (the fluke-proof ranking)
+  splits/seed_<seed>.json  exact train/val/test group_ids + npy filenames for
+                         that seed -> proves what was train vs test, reproducible
+  multiseed_summary.xlsx sheets: mean_std | per_run | split_manifest
+  seed_<seed>/<variant>/ predictions.csv + metrics.json always; with
+                         --export_artifacts also model.pt/scaler/pca/inference_meta
+
+REPRODUCE ONE MODEL EXACTLY (e.g. tiny_l9_pca95 at seed 44):
+python ec2/neural_baseline_multiseed.py ... --seeds 44 --variants tiny_l9_pca95
+# identical numbers to that model's row in the full multi-seed per_run.csv.
+
+READING: high *_mean + low *_std = best architecture. Big *_std = its score
+depends on the split (fluke). NOTE these numbers are NOT the headline-sweep
+numbers (different seeding); use neural_baseline_ablation.py (A3) when you need
+the exact original sheet number. This file answers "which arch is robust", A3
+answers "reproduce the one headline".
+
+================================================================================
 B)  LISTEN TO THE AUGMENTATIONS   (2 scripts, npy -> wav only locally)
 ================================================================================
 PII boundary:
