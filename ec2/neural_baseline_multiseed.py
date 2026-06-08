@@ -498,17 +498,21 @@ def main() -> int:
         row["avg_n_train"] = int(round(g["n_train"].mean()))
         row["avg_n_val"] = int(round(g["n_val"].mean()))
         row["avg_n_test"] = int(round(g["n_test"].mean()))
-        # headline averaged metrics first (avg_<name> + std_<name>)
+        # which seed gave this variant's best (max) best_f1
+        best_row = g.loc[g["test_best_f1"].idxmax()]
+        row["best_f1_seed"] = int(best_row["seed"])
+        # headline metrics: avg_<name> + std_<name> + best_<name> (max over seeds)
         for col, name in headline + extra:
             row[f"avg_{name}"] = round(float(g[col].mean()), 4)
             row[f"std_{name}"] = round(float(g[col].std(ddof=0)), 4)
+            row[f"best_{name}"] = round(float(g[col].max()), 4)
         rows.append(row)
     lead = ["variant", "arch", "wavlm_layer", "hidden", "pca", "mode",
-            "n_seeds", "seeds", "in_dim", "n_augs",
+            "n_seeds", "seeds", "best_f1_seed", "in_dim", "n_augs",
             "avg_n_train", "avg_n_val", "avg_n_test"]
     metric_cols = []
     for _, name in headline + extra:
-        metric_cols += [f"avg_{name}", f"std_{name}"]
+        metric_cols += [f"avg_{name}", f"std_{name}", f"best_{name}"]
     summary = (pd.DataFrame(rows)[lead + metric_cols]
                .sort_values("avg_best_f1", ascending=False)
                .reset_index(drop=True))
@@ -531,13 +535,15 @@ def main() -> int:
     log.info("=" * 70)
     log.info("ARCHITECTURE RANKING over %d seed(s) %s (avg +/- std):",
              len(seeds), seeds)
-    show = ["variant", "n_seeds", "avg_best_f1", "std_best_f1",
-            "avg_recall@p80", "avg_recall@p85", "avg_recall@p90",
-            "avg_recall@p95", "avg_auc"]
+    show = ["variant", "n_seeds", "avg_best_f1", "std_best_f1", "best_best_f1",
+            "best_f1_seed", "avg_recall@p90", "best_recall@p90",
+            "avg_recall@p95", "best_recall@p95", "avg_auc"]
     log.info("\n%s", summary[[c for c in show if c in summary.columns]]
              .to_string(index=False))
-    log.info("READING: high avg_* with low std_* = genuinely best architecture "
-             "(not a lucky seed). Big std_* = its score is a fluke of the split. "
+    log.info("READING: avg_* = mean over seeds, best_* = the top seed's value, "
+             "std_* = spread. High avg_* with low std_* = genuinely best "
+             "architecture (not a lucky seed); a high best_* but high std_* means "
+             "that score was a fluke of one split (best_f1_seed names it). "
              "Reproduce any single model with --seeds <seed> --variants <variant>; "
              "its split is in splits/seed_<seed>.json and init seed (model_seed) "
              "in per_run.csv / metrics.json.")

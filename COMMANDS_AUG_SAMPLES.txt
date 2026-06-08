@@ -230,15 +230,20 @@ python ec2/neural_baseline_multiseed.py \
 OUTPUTS (in --out_dir):
   per_run.csv            one row per (variant, seed): metrics + model_seed +
                          train/val/test row & candidate counts (the audit trail)
-  summary_mean_std.csv   per variant, averaged over the seeds. Lead columns are
-                         general info (variant/arch/layer/pca/hidden, n_seeds,
-                         seeds, in_dim, n_augs, avg_n_train/val/test) then the
-                         headline averages each with its std:
-                           avg_best_f1, std_best_f1,
-                           avg_recall@p80/85/90/95 (+ std_recall@p80/85/90/95),
-                           avg_val_f1, avg_auc, avg_ap, avg_f1@0.5, avg_best_thr,
-                           avg_ind_recall@p90, avg_php_recall@p90 (+ their stds).
-                         Sorted by avg_best_f1 desc = the fluke-proof ranking.
+  summary_mean_std.csv   ONE ROW PER VARIANT, aggregated over the seeds (so you
+                         read how each ARCHITECTURE performs across 5 splits).
+                         Lead = general info (variant/arch/layer/pca/hidden,
+                         n_seeds, seeds, best_f1_seed, in_dim, n_augs,
+                         avg_n_train/val/test). Then, for every metric, THREE
+                         columns -- avg_ (mean over seeds), std_ (spread),
+                         best_ (the top seed's value):
+                           best_f1   : avg_best_f1 / std_best_f1 / best_best_f1
+                           recall@p80/85/90/95 : avg_/std_/best_ each
+                           also val_f1, auc, ap, f1@0.5, best_thr,
+                           ind_recall@p90, php_recall@p90 (avg/std/best each).
+                         best_f1_seed = which seed gave that variant's top
+                         best_f1. Sorted by avg_best_f1 desc = fluke-proof rank;
+                         compare avg_ vs best_ to see how much was luck.
   splits/seed_<seed>.json  exact train/val/test group_ids + npy filenames for
                          that seed -> proves what was train vs test, reproducible
   multiseed_summary.xlsx sheets: mean_std | per_run | split_manifest
