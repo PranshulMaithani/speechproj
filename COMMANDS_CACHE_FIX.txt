@@ -1,0 +1,119 @@
+================================================================================
+EMBEDDINGS CACHE -- DIAGNOSE / STAMP / EXTEND  (fixes "built with different
+models" and legacy/unknown caches). Run all on EC2.
+================================================================================
+Caches on this project (keep at SEPARATE paths, never mix):
+  /home/ubuntu/nn/data/embeddings_cache.npz            BASE  = wavlm-base-plus(768) + whisper-medium(1024)   <- M1/M2 train on this
+  /home/ubuntu/nn/data/embeddings_cache_large_noaux.npz LARGE = wavlm-large(1024)   + whisper-large-v3(1280)
+
+Why the error happens:
+  extract_embeddings.py stamps each cache with the model IDs it was built with
+  and REFUSES to add to it unless the IDs you pass match. An OLD cache has no
+  stamp -> it reads as "(unknown/legacy)" -> never matches -> error. Fix = write
+  the correct IDs into the cache ONCE (no re-extraction), then extend normally.
+  It does NOT overwrite your cache on this error; your data is safe.
+
+
+================================================================================
+STEP 1 -- SEE WHAT EVERY CACHE IS (dims tell you the model; ids may be legacy)
+================================================================================
+python - <<'PY'
+import numpy as np, glob, os
+for p in sorted(glob.glob("/home/ubuntu/nn/**/*.npz", recursive=True)):
+    try:
+        c = np.load(p, allow_pickle=True); keys = list(c.files)
+        wl = next((k for k in keys if k.startswith("wavlm_")), None)
+        wh = next((k for k in keys if k.startswith("whisper_")), None)
+        wid  = str(c["wavlm_id"])   if "wavlm_id"   in keys else "(legacy)"
+        whid = str(c["whisper_id"]) if "whisper_id" in keys else "(legacy)"
+        layers = list(c["wavlm_layers"]) if "wavlm_layers" in keys else "(absent->'last' only)"
+        augs = list(c["aug_names"]) if "aug_names" in keys else "(absent)"
+        nf = len(c["filenames"]) if "filenames" in keys else "?"
+        print(f"{p}\n  wavlm={wid} ({c[wl].shape[1]}d)  whisper={whid} ({c[wh].shape[1]}d)\n"
+              f"  layers={layers}  augs={augs}  files={nf}  {round(os.path.getsize(p)/1e6,1)}MB")
+    except Exception as e:
+        print(p, "ERR", e)
+PY
+# dims key: wavlm 768=base-plus / 1024=large ; whisper 1024=medium / 1280=large-v3 / 768=small
+# A real BASE cache must show wavlm 768, whisper 1024, layers ['last','9'], 8 augs.
+
+
+================================================================================
+STEP 2 -- STAMP A LEGACY CACHE (one-time, NO re-extraction). Base cache shown.
+================================================================================
+# Edit P if your base cache path/name differs. Refuses if dims != 768/1024, and
+# VERIFIES the stamp persisted (if it prints VERIFIED, the extract WILL pass).
+cd /home/ubuntu/nn/data
+cp embeddings_cache.npz embeddings_cache.npz.bak       # backup first
+python - <<'PY'
+import numpy as np, sys
+P = "embeddings_cache.npz"          # <-- base cache path
+WAVLM_ID, WHISPER_ID = "microsoft/wavlm-base-plus", "openai/whisper-medium"
+c = dict(np.load(P, allow_pickle=True))
+wl = next(k for k in c if k.startswith("wavlm_"))
+wh = next(k for k in c if k.startswith("whisper_"))
+wdim, hdim = c[wl].shape[1], c[wh].shape[1]
+print("wavlm dim:", wdim, "| whisper dim:", hdim,
+      "| has wavlm_layers:", "wavlm_layers" in c,
+      "| augs:", list(c["aug_names"]) if "aug_names" in c else "(none)")
+if (wdim, hdim) != (768, 1024):
+    print(">>> NOT base-plus/medium (768/1024) -- this is NOT the base cache. Do not stamp.")
+    sys.exit(1)
+c["wavlm_id"]   = np.array(WAVLM_ID, dtype=object)
+c["whisper_id"] = np.array(WHISPER_ID, dtype=object)
+if "wavlm_layers" not in c:
+    c["wavlm_layers"] = np.array(["last"], dtype=object)
+np.savez(P, **c)
+c2 = np.load(P, allow_pickle=True)
+print("VERIFIED stamped:", str(c2["wavlm_id"]), "+", str(c2["whisper_id"]))
+PY
+# For the LARGE cache it is already stamped -- skip Step 2; in Step 3 pass:
+#   --out_path /home/ubuntu/nn/data/embeddings_cache_large_noaux.npz \
+#   --wavlm_id microsoft/wavlm-large --whisper_id openai/whisper-large-v3
+
+
+================================================================================
+STEP 3 -- EXTEND THE CACHE WITH THE NEW BATCH (incremental, only new rows)
+================================================================================
+# --augs and --wavlm_layers MUST match what Step 1 printed for this cache
+# (base = layers ['last','9'], the 8 augs below). If layers showed only
+# ['last'], use --wavlm_layers last instead.
+cd /home/ubuntu/nn && source venv/bin/activate
+python ec2/extract_embeddings.py \
+    --data_dir /home/ubuntu/nn/data \
+    --out_path /home/ubuntu/nn/data/embeddings_cache.npz \
+    --augs orig,noise,pitch,speed,gain,air,vtlp,combo \
+    --wavlm_layers last,9
+# GOOD sign in the log:  files needing extraction = <your new-batch count>
+
+
+================================================================================
+STEP 4 -- VERIFY CACHE COVERS GT
+================================================================================
+python - <<'PY'
+import numpy as np, pandas as pd
+c  = np.load("/home/ubuntu/nn/data/embeddings_cache.npz", allow_pickle=True)
+gt = pd.read_csv("/home/ubuntu/nn/data/gt.csv")
+miss = set(gt["npy_filename"].astype(str)) - set(c["filenames"].astype(str))
+w = c["wavlm_last_orig"]; z = int((np.abs(w).sum(1)==0).sum())
+print("rows in gt:", len(gt), "| missing from cache:", len(miss), "(want 0) | all-zero orig:", z, "(want 0)")
+PY
+
+
+================================================================================
+IF IT STILL SAYS "DIFFERENT MODELS" AFTER A VERIFIED STAMP
+================================================================================
+The only causes left:
+  1. --out_path in Step 3 points at a DIFFERENT file than you stamped in Step 2.
+     Check the path character-for-character (and that you stamped THAT file).
+  2. The error's "cached:" line still says (unknown/legacy) -> you are reading a
+     different cache; re-run Step 1 and confirm which file got the stamp.
+
+DO NOT use --force to silence this. --force ignores the cache and re-encodes
+EVERY batch from npy (needs all npy on EC2, slow) and rebuilds the cache. Only
+use it if Step 1 shows the file is genuinely the wrong model / corrupt and you
+intend to rebuild from scratch at a fresh, clearly-named --out_path.
+
+Lost a cache? It is fully rebuildable from npy + gt.csv (orig embeddings are
+deterministic; augs are seeded) -- just run Step 3 with the right model IDs at a
+new --out_path.
