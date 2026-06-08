@@ -7,7 +7,12 @@ Layout matches the existing audios6_eval pipeline:
         audios2GT.csv                       <-- columns: filename, label, [region]
         audios2_features.csv                <-- handcrafted numeric features (optional)
         audios2_transcripts.json            <-- {filename: transcript} (fallback)
-        ... same for audios3..audios6 ...
+        ... same for audios3..audios7 ...
+
+Adding a new batch (audios7, audios8, ...): drop its audios<N>/ folder and an
+audios<N>GT.csv next to this script and re-run. discover_batches() finds any
+audios<N>/ that has a matching GT csv, so no code edit is needed. (Mixed-region
+batches must carry a region column in their GT csv; see DEFAULT_REGION_BY_BATCH.)
 
 Output (under OUTPUT_ROOT):
     upload/audio_npy/<group_id>_<question_id>.npy   <-- upload to EC2
@@ -58,7 +63,11 @@ from text_features import TEXT_FEATURE_NAMES, compute_text_features
 AUDIO_ROOT = Path(__file__).resolve().parent
 OUTPUT_ROOT = AUDIO_ROOT.parent / "data" / "neural_prep_out"
 
-BATCHES = ["audios2", "audios3", "audios4", "audios5", "audios6"]
+# Baseline batches always considered. main() also AUTO-DISCOVERS any other
+# audios<N>/ folder that has a sibling <batch>GT.csv (see discover_batches), so a
+# new batch -- audios7, audios8, ... -- is picked up with zero code changes. A
+# name listed here but missing on disk is simply skipped with a warning.
+BATCHES = ["audios2", "audios3", "audios4", "audios5", "audios6", "audios7"]
 
 # Mirrors LABEL_MAP in audios6_eval.ipynb so the same GT csvs Just Work.
 TEXT_LABEL_MAP: dict[str, int] = {
@@ -67,13 +76,18 @@ TEXT_LABEL_MAP: dict[str, int] = {
     "genuine": 0,
 }
 
-# Batches that are entirely IND -- their GT csv may not have a region column.
+# Batches that are entirely one region -- their GT csv may omit a region column,
+# so we fall back to this. Mixed-region batches (audios6, and audios7 unless you
+# add it here) are intentionally omitted and MUST carry a region column in their
+# GT csv; rows without one get region=None (handled downstream).
 DEFAULT_REGION_BY_BATCH: dict[str, str] = {
     "audios2": "IND",
     "audios3": "IND",
     "audios4": "IND",
     "audios5": "IND",
-    # audios6 intentionally omitted: it has both IND and PHP; rely on its GT.
+    # audios6 omitted: mixed IND+PHP, rely on its GT.
+    # audios7 omitted: provide its region in audios7GT.csv, or add a default here
+    #         (e.g. "audios7": "IND") if it is single-region with no column.
 }
 
 # NOTE: ALLSTAR ingestion (folders 2676/2677) has been moved to
@@ -259,6 +273,37 @@ def parse_cid_qid(stem: str) -> tuple[str, int] | None:
         return None
 
 
+BATCH_DIR_RE = re.compile(r"^audios\d+$")
+
+
+def _batch_sort_key(name: str) -> tuple[int, int | str]:
+    """Order audios<N> numerically (audios2 < audios7 < audios10); anything
+    non-numeric sorts after, lexically, so the order is always deterministic."""
+    digits = re.sub(r"\D", "", name)
+    return (0, int(digits)) if digits else (1, name)
+
+
+def discover_batches(root: Path, explicit: list[str], log: logging.Logger) -> list[str]:
+    """Final batch list = the explicit baseline UNION every audios<N>/ folder on
+    disk that has a sibling <batch>GT.csv. This makes a new batch (audios7,
+    audios8, ...) Just Work: drop the folder + its GT csv and re-run, no edit
+    needed. Requiring the GT csv avoids picking up stray/incomplete folders.
+    An explicit name with no folder is kept (the main loop warns + skips it)."""
+    found: set[str] = set(explicit)
+    for d in sorted(root.iterdir(), key=lambda p: p.name):
+        if not (d.is_dir() and BATCH_DIR_RE.match(d.name)):
+            continue
+        if d.name in found:
+            continue
+        if (root / f"{d.name}GT.csv").exists():
+            found.add(d.name)
+            log.info("auto-discovered batch '%s' (has %sGT.csv)", d.name, d.name)
+        else:
+            log.info("skip folder '%s' -- no %sGT.csv, not treated as a batch",
+                     d.name, d.name)
+    return sorted(found, key=_batch_sort_key)
+
+
 # ----------------------------------------------------------------------------
 # Audio
 # ----------------------------------------------------------------------------
@@ -289,12 +334,14 @@ def main() -> int:
     log = setup_logging(local_dir / "prep_log.txt")
     log.info("AUDIO_ROOT  = %s", AUDIO_ROOT)
     log.info("OUTPUT_ROOT = %s", OUTPUT_ROOT)
-    log.info("BATCHES     = %s", BATCHES)
     log.info("TARGET_SR   = %d Hz, MAX_DURATION_SEC = %s", TARGET_SR, MAX_DURATION_SEC)
 
     if not AUDIO_ROOT.exists():
         log.error("AUDIO_ROOT does not exist: %s", AUDIO_ROOT)
         return 1
+
+    batches = discover_batches(AUDIO_ROOT, BATCHES, log)
+    log.info("BATCHES (explicit + auto-discovered) = %s", batches)
 
     cid_mapping_path = local_dir / "cid_mapping.json"
     cid_mapping = load_cid_mapping(cid_mapping_path)
@@ -308,7 +355,7 @@ def main() -> int:
     n_with_transcripts = 0
     n_no_text = 0
 
-    for batch in BATCHES:
+    for batch in batches:
         batch_dir = AUDIO_ROOT / batch
         if not batch_dir.exists():
             log.warning("Missing batch dir: %s -- skipping", batch_dir)
