@@ -1,0 +1,166 @@
+================================================================================
+ADD A NEW BATCH (e.g. audios7) -- LAPTOP -> BUCKET -> EC2 -> TRAIN
+================================================================================
+Fill in the <PLACEHOLDERS>:
+  <BUCKET>     your S3 bucket name
+  <DATA_DIR>   EC2 data dir holding gt.csv + audio_npy/ + the cache
+               (default below: /home/ubuntu/nn/data)
+  <BASE_CACHE> the 768-d base cache file (wavlm-base-plus + whisper-medium) --
+               the one your finalized M1/M2 train on. Find it in TROUBLESHOOTING.
+
+What changes on EC2 (only 3 things):
+  gt.csv               -> REPLACED (prep rebuilds it for all batches incl. audios7)
+  audio_npy/           -> audios7 .npy ADDED (audios2..6 untouched)
+  embeddings_cache.npz -> UPDATED IN PLACE by extract_embeddings (keeps old, adds new)
+Embeddings are NOT uploaded -- the T4 computes them from the npy.
+
+PII: transcripts + real filenames NEVER leave the laptop. Only the anonymized
+gt.csv (feat_* numbers) + anonymized npy go to the bucket/EC2.
+
+Batch folder name pattern: audios<N>/ with files named <realCID>_<qid>.wav
+
+
+================================================================================
+PART A -- COMPANY LAPTOP
+================================================================================
+
+A0. Lay out inputs in companylaptop/ :
+      companylaptop/audios7/<realCID>_<qid>.wav      (the raw audio)
+      companylaptop/audios7GT.csv                    (cols: filename,label[,region])
+    Mixed-region batch -> put a region column in the GT csv.
+    Single-region with no column -> add  "audios7": "IND"  (or PHP) to
+    DEFAULT_REGION_BY_BATCH in neural_baseline_prep.py.
+
+A1. Transcribe + RICH features (small model + filler prompt + word timestamps,
+    same 55 feat_* columns as audios2..6). Needs faster-whisper + spacy +
+    parselmouth + transformers installed (see companylaptop/requirements.txt):
+        pip install faster-whisper spacy praat-parselmouth transformers torch
+        python -m spacy download en_core_web_sm
+
+    python companylaptop/extract_features_batch.py --batch audios7
+    # GPU if available:
+    # python companylaptop/extract_features_batch.py --batch audios7 --device cuda --compute_type float16
+    # -> writes audios7_transcripts.json + audios7_features.csv (both LOCAL)
+
+A2. Prep -> anonymized gt.csv + npy (auto-discovers audios7):
+
+    python companylaptop/neural_baseline_prep.py
+    # KEEP data/neural_prep_out/local/cid_mapping.json (so old ids stay stable)
+    # In the log, confirm audios7 appears and "rows w/ features.csv" covers it.
+
+A3. Stage ONLY the audios7 npy + the new gt.csv into one zip (PowerShell):
+
+    $up = "D:\GoodProjects\Speech project\data\neural_prep_out\upload"
+    $stage = "D:\audios7_upload"
+    Remove-Item -Recurse -Force $stage -ErrorAction SilentlyContinue
+    New-Item -ItemType Directory -Force "$stage\audio_npy" | Out-Null
+    Copy-Item "$up\gt.csv" "$stage\gt.csv"
+    Import-Csv "$up\gt.csv" | Where-Object batch -eq 'audios7' |
+        ForEach-Object { Copy-Item "$up\audio_npy\$($_.npy_filename)" "$stage\audio_npy\" }
+    "staged npy: " + (Get-ChildItem "$stage\audio_npy").Count
+    Compress-Archive -Path "$stage\*" -DestinationPath "D:\audios7_upload.zip" -Force
+
+    # CHECK: "staged npy" must equal your audios7 row count.
+
+A4. Put the zip in the bucket (console drag-drop, OR aws cli):
+        aws s3 cp D:\audios7_upload.zip s3://<BUCKET>/
+
+
+================================================================================
+PART B -- EC2
+================================================================================
+
+B1. Pull + unzip into the data dir (replaces gt.csv, adds audios7 npy):
+
+    cd <DATA_DIR>            # e.g. /home/ubuntu/nn/data
+    cp gt.csv gt.csv.bak
+    aws s3 cp s3://<BUCKET>/audios7_upload.zip .
+    unzip -o audios7_upload.zip -d <DATA_DIR>
+
+B2. Build embeddings -- ONLY audios7 gets encoded (incremental).
+    IMPORTANT: --out_path, --augs, --wavlm_layers, and the model IDs must match
+    the cache you are extending. For the BASE cache (defaults = wavlm-base-plus
+    + whisper-medium) no --wavlm_id/--whisper_id needed:
+
+    cd /home/ubuntu/nn && source venv/bin/activate
+    tmux new -s emb                      # survive SSH drop; detach Ctrl-b then d
+    python ec2/extract_embeddings.py \
+        --data_dir <DATA_DIR> \
+        --out_path <BASE_CACHE> \
+        --augs orig,noise,pitch,speed,gain,air,vtlp,combo \
+        --wavlm_layers last,9
+
+    # Watch for:  files needing extraction = <your audios7 count>
+    # (= it's only doing audios7 and reusing audios2..6)
+
+B3. Verify the cache lines up with gt:
+
+    python - <<'PY'
+    import numpy as np, pandas as pd
+    c  = np.load("<BASE_CACHE>", allow_pickle=True)
+    gt = pd.read_csv("<DATA_DIR>/gt.csv")
+    miss = set(gt["npy_filename"].astype(str)) - set(c["filenames"].astype(str))
+    w = c["wavlm_last_orig"]; z = int((np.abs(w).sum(1)==0).sum())
+    print("rows in gt :", len(gt))
+    print("missing from cache :", len(miss), " (must be 0)")
+    print("all-zero orig embeddings :", z, " (must be 0)")
+    PY
+
+B4. Train with audios7 (multi-seed arch comparison, test on the new batch):
+
+    python ec2/neural_baseline_multiseed.py \
+        --data_dir <DATA_DIR> --cache <BASE_CACHE> \
+        --out_dir /home/ubuntu/nn/runs/multiseed_audios7 \
+        --train_batches audios2,audios4,audios5,audios6,audios7 \
+        --test_batches audios7 \
+        --seeds 42,43,44,45,46
+    # Drop --test_batches for the 20pct reshuffle mode, or put audios7 only in
+    # --train_batches if it's a train-pool addition rather than a held-out test.
+
+
+================================================================================
+TROUBLESHOOTING -- "EXISTING CACHE WAS BUILT WITH DIFFERENT MODELS"
+================================================================================
+Means the model IDs stamped in the cache at --out_path != the IDs you asked for.
+extract_embeddings REFUSES to mix (it does NOT overwrite -- your cache is safe
+unless you passed --force).
+
+List every cache on EC2 and what each holds (wavlm 768=base-plus, 1024=large;
+whisper 1024=medium, 1280=large-v3):
+
+    python - <<'PY'
+    import numpy as np, glob, os
+    for p in sorted(glob.glob("/home/ubuntu/nn/**/*.npz", recursive=True)):
+        try:
+            c = np.load(p, allow_pickle=True)
+            wl = next((k for k in c.files if k.startswith("wavlm_")), None)
+            wid  = str(c["wavlm_id"])   if "wavlm_id"   in c.files else "(legacy)"
+            whid = str(c["whisper_id"]) if "whisper_id" in c.files else "(legacy)"
+            dim  = c[wl].shape[1] if wl else "?"
+            nf   = len(c["filenames"]) if "filenames" in c.files else "?"
+            print(f"{p}\n   wavlm={wid} ({dim}d)  whisper={whid}  files={nf}  "
+                  f"{round(os.path.getsize(p)/1e6,1)}MB")
+        except Exception as e:
+            print(p, "ERR", e)
+    PY
+    # widen with: find / -name "*.npz" 2>/dev/null   if nothing under nn/
+
+Then:
+  * TWO files (a 768d and a 1024d) -> base cache is fine, just a different name.
+    Point --out_path (and training --cache) at the 768d file = <BASE_CACHE>.
+  * Cache shows real large IDs -> pass them so audios7 matches:
+        --wavlm_id microsoft/wavlm-large --whisper_id openai/whisper-large-v3
+        (and use a SEPARATE out_path for the large cache, e.g. ..._large.npz)
+  * wavlm_id=(legacy) -> old cache, unverifiable. If you are sure it is
+    base-plus + whisper-medium, rebuild cleanly with --force (re-extracts
+    audios2..7; deterministic, just slower). Do NOT --force otherwise.
+
+Keep caches at SEPARATE paths and name them clearly:
+    embeddings_cache_base.npz    (wavlm-base-plus + whisper-medium -> M1/M2)
+    embeddings_cache_large.npz   (wavlm-large + whisper-large-v3)
+Add audios7 to whichever model family you train (run B2 once per cache with the
+matching model IDs). Your finalized M1/M2 use the BASE cache.
+
+Lost the base cache? It is fully rebuildable from the npy + gt.csv (orig
+embeddings are deterministic, augs are seeded) -- just re-run B2 with base
+defaults at a fresh --out_path.
