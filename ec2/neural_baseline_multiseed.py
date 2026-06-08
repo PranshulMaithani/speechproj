@@ -193,11 +193,13 @@ def main() -> int:
                          "tiny_l9_pca95,default_last_pca98). Empty = all 30. "
                          "Restricting this never changes any model's result -- "
                          "each (variant, seed) is independently seeded.")
-    ap.add_argument("--export_artifacts", default="false",
+    ap.add_argument("--export_artifacts", default="true",
                     choices=["true", "false"],
                     help="Save model.pt + scaler.joblib + pca.joblib + "
                          "inference_meta.json per (seed, variant) so the exact "
-                         "model file is downloadable and reproducible.")
+                         "model file is downloadable and reproducible. ON by "
+                         "default (every model file is kept); set false to save "
+                         "disk and keep only predictions.csv + metrics.json.")
     ap.add_argument("--batch_size", type=int, default=64)
     ap.add_argument("--epochs", type=int, default=60)
     ap.add_argument("--lr", type=float, default=1e-3)
@@ -473,24 +475,47 @@ def main() -> int:
     log.info("Wrote %s (%d model runs)", per_run_path, len(per_run))
 
     # ---- mean +/- std per variant across seeds = fluke-proof ranking ----
-    agg_metrics = ["val_f1", "test_auc", "test_ap", "test_f1@0.5",
-                   "test_best_f1", "recall@p80", "recall@p85", "recall@p90",
-                   "recall@p95"]
+    # The headline metrics you asked for lead the columns (avg best-f1, avg
+    # recall@p80/85/90/95), each with its std; then the rest + general info.
+    # Column name -> friendly summary name.
+    headline = [("test_best_f1", "best_f1"), ("recall@p80", "recall@p80"),
+                ("recall@p85", "recall@p85"), ("recall@p90", "recall@p90"),
+                ("recall@p95", "recall@p95")]
+    extra = [("val_f1", "val_f1"), ("test_auc", "auc"), ("test_ap", "ap"),
+             ("test_f1@0.5", "f1@0.5"), ("test_best_thr", "best_thr"),
+             ("ind_r@p90", "ind_recall@p90"), ("php_r@p90", "php_recall@p90")]
     grp = per_run.groupby(["variant", "arch", "wavlm_layer", "hidden", "pca"],
                           sort=False)
     rows = []
     for keys, g in grp:
         row = dict(zip(["variant", "arch", "wavlm_layer", "hidden", "pca"], keys))
+        # general info shared across this variant's seeds
+        row["mode"] = mode_tag
         row["n_seeds"] = int(len(g))
         row["seeds"] = ",".join(str(s) for s in sorted(g["seed"].tolist()))
-        for col in agg_metrics:
-            row[f"{col}_mean"] = round(float(g[col].mean()), 4)
-            row[f"{col}_std"] = round(float(g[col].std(ddof=0)), 4)
+        row["in_dim"] = int(g["in_dim"].iloc[0])
+        row["n_augs"] = int(g["n_augs"].iloc[0])
+        row["avg_n_train"] = int(round(g["n_train"].mean()))
+        row["avg_n_val"] = int(round(g["n_val"].mean()))
+        row["avg_n_test"] = int(round(g["n_test"].mean()))
+        # headline averaged metrics first (avg_<name> + std_<name>)
+        for col, name in headline + extra:
+            row[f"avg_{name}"] = round(float(g[col].mean()), 4)
+            row[f"std_{name}"] = round(float(g[col].std(ddof=0)), 4)
         rows.append(row)
-    summary = pd.DataFrame(rows).sort_values("test_best_f1_mean", ascending=False)
+    lead = ["variant", "arch", "wavlm_layer", "hidden", "pca", "mode",
+            "n_seeds", "seeds", "in_dim", "n_augs",
+            "avg_n_train", "avg_n_val", "avg_n_test"]
+    metric_cols = []
+    for _, name in headline + extra:
+        metric_cols += [f"avg_{name}", f"std_{name}"]
+    summary = (pd.DataFrame(rows)[lead + metric_cols]
+               .sort_values("avg_best_f1", ascending=False)
+               .reset_index(drop=True))
     summary_path = out_dir / "summary_mean_std.csv"
     summary.to_csv(summary_path, index=False)
-    log.info("Wrote %s", summary_path)
+    log.info("Wrote %s (per-variant avg over %d seeds; lead cols: avg_best_f1, "
+             "avg_recall@p80/85/90/95)", summary_path, len(seeds))
 
     manifest_df = pd.DataFrame(manifest_rows)
     try:
@@ -504,14 +529,15 @@ def main() -> int:
 
     # ---- headline ranking to the log ----
     log.info("=" * 70)
-    log.info("ARCHITECTURE RANKING over %d seed(s) %s (mean +/- std):",
+    log.info("ARCHITECTURE RANKING over %d seed(s) %s (avg +/- std):",
              len(seeds), seeds)
-    show = ["variant", "n_seeds", "test_best_f1_mean", "test_best_f1_std",
-            "recall@p90_mean", "recall@p90_std", "test_auc_mean", "test_auc_std"]
+    show = ["variant", "n_seeds", "avg_best_f1", "std_best_f1",
+            "avg_recall@p80", "avg_recall@p85", "avg_recall@p90",
+            "avg_recall@p95", "avg_auc"]
     log.info("\n%s", summary[[c for c in show if c in summary.columns]]
              .to_string(index=False))
-    log.info("READING: high *_mean with low *_std = genuinely best architecture "
-             "(not a lucky seed). Big *_std = its score is a fluke of the split. "
+    log.info("READING: high avg_* with low std_* = genuinely best architecture "
+             "(not a lucky seed). Big std_* = its score is a fluke of the split. "
              "Reproduce any single model with --seeds <seed> --variants <variant>; "
              "its split is in splits/seed_<seed>.json and init seed (model_seed) "
              "in per_run.csv / metrics.json.")

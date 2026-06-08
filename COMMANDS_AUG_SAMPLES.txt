@@ -224,18 +224,29 @@ python ec2/neural_baseline_multiseed.py \
 # 20pct: drop --test_batches (everything reshuffled per seed).
 # Restrict variants: --variants tiny_l9_pca95,default_last_pca98
 # Add aux train rows (never val/test): --train_only_batches casual
-# Save downloadable model files: --export_artifacts true
+# Every model file (model.pt/scaler/pca/meta) is saved by DEFAULT; pass
+#   --export_artifacts false to keep only predictions.csv + metrics.json.
 
 OUTPUTS (in --out_dir):
   per_run.csv            one row per (variant, seed): metrics + model_seed +
                          train/val/test row & candidate counts (the audit trail)
-  summary_mean_std.csv   per variant: <metric>_mean / <metric>_std across seeds,
-                         ranked by test_best_f1_mean (the fluke-proof ranking)
+  summary_mean_std.csv   per variant, averaged over the seeds. Lead columns are
+                         general info (variant/arch/layer/pca/hidden, n_seeds,
+                         seeds, in_dim, n_augs, avg_n_train/val/test) then the
+                         headline averages each with its std:
+                           avg_best_f1, std_best_f1,
+                           avg_recall@p80/85/90/95 (+ std_recall@p80/85/90/95),
+                           avg_val_f1, avg_auc, avg_ap, avg_f1@0.5, avg_best_thr,
+                           avg_ind_recall@p90, avg_php_recall@p90 (+ their stds).
+                         Sorted by avg_best_f1 desc = the fluke-proof ranking.
   splits/seed_<seed>.json  exact train/val/test group_ids + npy filenames for
                          that seed -> proves what was train vs test, reproducible
   multiseed_summary.xlsx sheets: mean_std | per_run | split_manifest
-  seed_<seed>/<variant>/ predictions.csv + metrics.json always; with
-                         --export_artifacts also model.pt/scaler/pca/inference_meta
+  seed_<seed>/<variant>/ EVERY model: predictions.csv + metrics.json + (with
+                         --export_artifacts true, the DEFAULT) model.pt +
+                         scaler.joblib + pca.joblib + inference_meta.json.
+                         Set --export_artifacts false to keep only predictions +
+                         metrics (saves disk; 30 variants x N seeds model files).
 
 REPRODUCE ONE MODEL EXACTLY (e.g. tiny_l9_pca95 at seed 44):
 python ec2/neural_baseline_multiseed.py ... --seeds 44 --variants tiny_l9_pca95
