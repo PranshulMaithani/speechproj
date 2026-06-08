@@ -296,3 +296,55 @@ MINIMAL INFERENCE (per audio), using a downloaded variant folder:
   # prob = sigmoid(model(x)); cheat = prob >= meta["best_f1_threshold"]
   -> feed wavlm/whisper from extract_embeddings.py (same wavlm_id/whisper_id,
      TARGET_SR=16000) and feat_* exactly as in gt.csv.
+
+================================================================================
+FINAL EVALUATION OF THE 2 FINALISED MODELS (ec2/evaluate_final_models.py)
+================================================================================
+Loads the STORED WEIGHTS of the two finalised pairings and produces one workbook
+of detailed results + per-row predictions + threshold sweeps:
+    Model 1 : default_last_pca98 (+casual)  @ 20pct   (run dir m1_casual_20pct)
+    Model 2 : tiny_l9_pca95                 @ a6      (run dir m2_nocasual_a6)
+
+For each model it reads the run's predictions.csv (its exact test set), rebuilds
+ORIG features from the cache, LOADS model.pt + scaler.joblib + pca.joblib and
+predicts, then VERIFIES the reproduced probs == the saved pred_score
+(repro_max_abs_diff ~0 = the stored weights are faithful).
+
+Needs the exported artifacts present:
+    <runs_root>/m1_casual_20pct/default_last_pca98/{model.pt,scaler.joblib,pca.joblib,predictions.csv}
+    <runs_root>/m2_nocasual_a6/tiny_l9_pca95/{model.pt,scaler.joblib,pca.joblib,predictions.csv}
+(If a run was made WITHOUT --export_artifacts true, re-run it once with that flag
+so model.pt/scaler/pca are written. predictions.csv is always written.)
+Uses the BASE cache (768/1024) -- the one M1/M2 train on.
+
+RUN:
+cd ~/speech3 && git pull
+pip install openpyxl            # one-time, to write the .xlsx
+python ec2/evaluate_final_models.py \
+    --data_dir  /home/ubuntu/nn/data \
+    --cache     /home/ubuntu/nn/data/embeddings_cache.npz \
+    --runs_root /home/ubuntu/nn/runs \
+    --out_dir   /home/ubuntu/nn/runs/final_eval
+# override dirs if named differently: --m1_dir m1_casual_20pct --m2_dir m2_nocasual_a6
+# finer/coarser sweep: --thr_step 0.005
+
+OUTPUTS (in --out_dir):
+  predictions_model1_20pct.csv   per-row preds + decisions @ best_thr / 0.5 / p90
+  predictions_model2_a6.csv
+  final_eval_summary.csv         both models side by side
+  evaluate_final_models.xlsx     sheets:
+     summary                     n/pos/prevalence, AUC, AP, best_f1+thr, f1/prec/
+                                 recall@0.5, recall@p50/80/85/90/95 + thresholds,
+                                 used_weights, repro_max_abs_diff
+     model1_20pct_preds          per-row predictions
+     model1_20pct_sweep          threshold 0..1: tp/fp/tn/fn/precision/recall/f1/
+                                 specificity/accuracy/n_pred_pos
+     model1_20pct_by_region      per-region metrics (auc/ap/best_f1/recall@p90/95)
+     model2_a6_preds / _sweep / _by_region
+
+READING:
+  * repro_max_abs_diff ~0 (e.g. <1e-3) => the stored weights reproduce the saved
+    predictions exactly; if it's large the cache/feature order doesn't match what
+    the model trained on (wrong cache?) -- fix before trusting the numbers.
+  * <model>_sweep: pick the row at your target precision (e.g. precision>=0.90)
+    to read the recall + the exact threshold to deploy at.
