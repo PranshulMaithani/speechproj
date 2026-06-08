@@ -22,8 +22,9 @@ import numpy as np, glob, os
 for p in sorted(glob.glob("/home/ubuntu/nn/**/*.npz", recursive=True)):
     try:
         c = np.load(p, allow_pickle=True); keys = list(c.files)
-        wl = next((k for k in keys if k.startswith("wavlm_")), None)
-        wh = next((k for k in keys if k.startswith("whisper_")), None)
+        # ndim==2 so we grab an embedding MATRIX, not the wavlm_id/wavlm_layers meta keys
+        wl = next((k for k in keys if k.startswith("wavlm_")   and c[k].ndim == 2), None)
+        wh = next((k for k in keys if k.startswith("whisper_") and c[k].ndim == 2), None)
         wid  = str(c["wavlm_id"])   if "wavlm_id"   in keys else "(legacy)"
         whid = str(c["whisper_id"]) if "whisper_id" in keys else "(legacy)"
         layers = list(c["wavlm_layers"]) if "wavlm_layers" in keys else "(absent->'last' only)"
@@ -50,8 +51,9 @@ import numpy as np, sys
 P = "embeddings_cache.npz"          # <-- base cache path
 WAVLM_ID, WHISPER_ID = "microsoft/wavlm-base-plus", "openai/whisper-medium"
 c = dict(np.load(P, allow_pickle=True))
-wl = next(k for k in c if k.startswith("wavlm_"))
-wh = next(k for k in c if k.startswith("whisper_"))
+# ndim==2 so we grab an embedding MATRIX, not the wavlm_id/wavlm_layers meta keys
+wl = next(k for k in c if k.startswith("wavlm_")   and c[k].ndim == 2)
+wh = next(k for k in c if k.startswith("whisper_") and c[k].ndim == 2)
 wdim, hdim = c[wl].shape[1], c[wh].shape[1]
 print("wavlm dim:", wdim, "| whisper dim:", hdim,
       "| has wavlm_layers:", "wavlm_layers" in c,
@@ -95,7 +97,8 @@ import numpy as np, pandas as pd
 c  = np.load("/home/ubuntu/nn/data/embeddings_cache.npz", allow_pickle=True)
 gt = pd.read_csv("/home/ubuntu/nn/data/gt.csv")
 miss = set(gt["npy_filename"].astype(str)) - set(c["filenames"].astype(str))
-w = c["wavlm_last_orig"]; z = int((np.abs(w).sum(1)==0).sum())
+wlk = next(k for k in c.files if k.startswith("wavlm_") and c[k].ndim == 2)
+w = c[wlk]; z = int((np.abs(w).sum(1)==0).sum())
 print("rows in gt:", len(gt), "| missing from cache:", len(miss), "(want 0) | all-zero orig:", z, "(want 0)")
 PY
 
