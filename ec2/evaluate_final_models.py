@@ -7,39 +7,47 @@ The two finalised (model x protocol) pairings, with exported artifacts:
     Model 2 : tiny_l9_pca95 (no casual)                  on the a6 split
               run dir default: m2_nocasual_a6/tiny_l9_pca95/
 
-For each, this:
-  1. reads the run's predictions.csv -- the model's exact test set (it is
-     gt.iloc[test_idx] + pred_score, so it carries label / batch / region /
-     group_id / feat_* already),
-  2. rebuilds the ORIG test features (wavlm[layer] + whisper + feat_*) from the
-     cache keyed by those npy_filenames,
-  3. LOADS the stored model.pt + scaler.joblib + pca.joblib and predicts -- i.e.
-     it genuinely uses the finalised weights -- and VERIFIES the reproduced
-     probabilities equal the saved pred_score (max|diff| should be ~0),
-  4. computes detailed metrics, a full threshold sweep, and a per-region
-     breakdown.
+Two modes:
 
-Outputs (in --out_dir):
-  predictions_model1_20pct.csv   per-row predictions (+ decisions at key thresholds)
-  predictions_model2_a6.csv
-  evaluate_final_models.xlsx     sheets:
-       summary                   both models side by side (AUC/AP/best-F1/
-                                 recall@p50..95/threshold + reproduction check)
-       model1_20pct_preds        per-row predictions
-       model1_20pct_sweep        threshold 0..1: tp/fp/tn/fn/prec/rec/f1/...
-       model1_20pct_by_region    per-region metrics
-       model2_a6_preds / _sweep / _by_region
+  (A) default -- evaluate each model on ITS OWN test set (the run's
+      predictions.csv). Reloads model.pt + scaler + pca, predicts, and VERIFIES
+      the reproduced probabilities equal the saved pred_score (~0 diff).
 
-Run:
+  (B) --test_batch audios7 -- evaluate BOTH finalised models on a NEW held-out
+      batch (e.g. audios7) that neither trained on, to check validity /
+      generalisation. Builds ORIG features for that batch from gt.csv + cache,
+      loads the SAME stored weights, predicts, scores against the batch labels.
+      (No saved pred_score to verify against -- it's fresh data.)
+
+Either way it computes detailed metrics, a full threshold sweep, and a
+per-region breakdown, written to per-row CSVs + one xlsx of sheets.
+
+Outputs (in --out_dir), <tag> = model1_20pct / model2_a6 (mode A) or
+<model>_on_<batch> (mode B):
+  predictions_<tag>.csv          per-row predictions (+ decisions at key thresholds)
+  final_eval_summary.csv         both models side by side
+  evaluate_final_models.xlsx     sheets: summary, <tag>_preds, <tag>_sweep,
+                                 <tag>_by_region (per model)
+
+Run (own test sets):
   python ec2/evaluate_final_models.py \
       --data_dir  /home/ubuntu/nn/data \
       --cache     /home/ubuntu/nn/data/embeddings_cache.npz \
       --runs_root /home/ubuntu/nn/runs \
       --out_dir   /home/ubuntu/nn/runs/final_eval
+
+Run (validity on the new audios7 batch):
+  python ec2/evaluate_final_models.py \
+      --data_dir  /home/ubuntu/nn/data \
+      --cache     /home/ubuntu/nn/data/embeddings_cache.npz \
+      --runs_root /home/ubuntu/nn/runs \
+      --out_dir   /home/ubuntu/nn/runs/final_eval_audios7 \
+      --test_batch audios7
 """
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -47,10 +55,11 @@ import numpy as np
 import pandas as pd
 import torch
 
-from _data_pipeline import (compute_metrics, load_cache_reindexed, setup_logging)
+from _data_pipeline import (compute_metrics, load_cache_reindexed,
+                            load_gt_and_filter, setup_logging)
 from neural_baseline_train import ARCH_CONFIG
 # Reuse the exact artifact loader + predictor used to anchor the headline numbers.
-from aug_ablation2 import load_and_predict, _rp
+from aug_ablation2 import load_and_predict
 from aug_ablation import _l9
 
 
@@ -112,18 +121,82 @@ def region_breakdown(df: pd.DataFrame, y: np.ndarray, p: np.ndarray) -> pd.DataF
     return pd.DataFrame(rows)
 
 
-def build_test_features(df: pd.DataFrame, layer: str, cache_path: Path, log):
-    """ORIG test features (wavlm[layer] + whisper + feat_*) for the exact rows in
-    a run's predictions.csv, keyed by npy_filename -- same feature order as train."""
+def build_features(df: pd.DataFrame, layer: str, cache_path: Path, log,
+                   feat_order: list[str] | None):
+    """ORIG features (wavlm[layer] + whisper + feat_*) for the rows in df, keyed
+    by npy_filename. feat columns follow feat_order (the model's training order,
+    from inference_meta.json) so the vector matches what the scaler/pca expect;
+    a feature missing from df is filled with 0.0."""
     filenames = df["npy_filename"].astype(str).to_numpy()
     wavlm_cache, whisper_cache = load_cache_reindexed(
         cache_path, filenames, ["orig"], [layer], log)
-    feat_cols = [c for c in df.columns if c.startswith("feat_")]
     parts = [wavlm_cache[(layer, "orig")], whisper_cache["orig"]]
-    if feat_cols:
-        feat = df[feat_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0)
+    if feat_order is None:
+        feat_order = [c for c in df.columns if c.startswith("feat_")]
+    if feat_order:
+        feat = (df.reindex(columns=feat_order)
+                  .apply(pd.to_numeric, errors="coerce").fillna(0.0))
         parts.append(feat.to_numpy().astype(np.float32))
-    return np.concatenate(parts, axis=1).astype(np.float32), len(feat_cols)
+    X = np.concatenate(parts, axis=1).astype(np.float32)
+    nz = int((np.abs(X).sum(1) == 0).sum())
+    if nz:
+        log.error("  %d/%d rows have ALL-ZERO features -- those npy are not in the "
+                  "cache (extract embeddings for this batch first).", nz, len(X))
+    return X, len(feat_order)
+
+
+def evaluate_and_record(tag: str, title: str, spec: dict, meta_df: pd.DataFrame,
+                        y: np.ndarray, p: np.ndarray, used_weights: bool,
+                        max_diff: float, eval_label: str, out_dir: Path,
+                        sheets: dict, summary_rows: list, thr_step: float, log):
+    m = compute_metrics(y, p)
+    n, npos, nneg = m["n"], m["n_pos"], m["n_neg"]
+    log.info("[%s] eval=%s  n=%d pos=%d (%.1f%%)  AUC=%.4f AP=%.4f best_f1=%.4f@%.2f",
+             tag, eval_label, n, npos, 100 * npos / max(n, 1), m["auc"], m["ap"],
+             m["best_f1"]["f1"], m["best_f1"]["threshold"])
+    log.info("[%s] recall@ p50=%.3f p80=%.3f p85=%.3f p90=%.3f p95=%.3f", tag,
+             _rap(m, "p50"), _rap(m, "p80"), _rap(m, "p85"), _rap(m, "p90"), _rap(m, "p95"))
+
+    best_thr = m["best_f1"]["threshold"]
+    def col(name):
+        return meta_df[name].astype(str) if name in meta_df.columns else ""
+    preds_out = pd.DataFrame({
+        "npy_filename": col("npy_filename"), "group_id": col("group_id"),
+        "question_id": meta_df["question_id"] if "question_id" in meta_df.columns else "",
+        "batch": col("batch"), "region": col("region"),
+        "label": y, "pred_score": np.round(p, 6),
+        "pred@best_thr": (p >= best_thr).astype(int),
+        "pred@0.5": (p >= 0.5).astype(int),
+        "pred@p90_thr": (p >= _rap(m, "p90", "threshold")).astype(int),
+    })
+    if "pred_score" in meta_df.columns:
+        preds_out["saved_pred_score"] = np.round(meta_df["pred_score"].to_numpy(float), 6)
+    preds_out.to_csv(out_dir / f"predictions_{tag}.csv", index=False)
+    sheets[f"{tag}_preds"] = preds_out
+    sheets[f"{tag}_sweep"] = threshold_sweep(y, p, thr_step)
+    rb = region_breakdown(meta_df, y, p)
+    if len(rb):
+        sheets[f"{tag}_by_region"] = rb
+
+    summary_rows.append({
+        "model": spec["key"], "title": title, "eval_set": eval_label,
+        "protocol": spec["protocol"], "variant": spec["variant"],
+        "run_dir": spec["run_dir"], "used_weights": used_weights,
+        "repro_max_abs_diff": (round(max_diff, 8) if max_diff == max_diff else float("nan")),
+        "n_test": n, "n_pos": npos, "n_neg": nneg,
+        "prevalence": round(npos / max(n, 1), 4),
+        "auc": round(m["auc"], 4), "ap": round(m["ap"], 4),
+        "best_f1": round(m["best_f1"]["f1"], 4), "best_thr": round(best_thr, 3),
+        "f1@0.5": round(m["thr0.5"]["f1"], 4),
+        "precision@0.5": round(m["thr0.5"].get("precision", float("nan")), 4),
+        "recall@0.5": round(m["thr0.5"].get("recall", float("nan")), 4),
+        "recall@p50": round(_rap(m, "p50"), 4), "recall@p80": round(_rap(m, "p80"), 4),
+        "recall@p85": round(_rap(m, "p85"), 4), "recall@p90": round(_rap(m, "p90"), 4),
+        "recall@p95": round(_rap(m, "p95"), 4),
+        "thr@p80": round(_rap(m, "p80", "threshold"), 3),
+        "thr@p90": round(_rap(m, "p90", "threshold"), 3),
+        "thr@p95": round(_rap(m, "p95", "threshold"), 3),
+    })
 
 
 def main() -> int:
@@ -137,6 +210,13 @@ def main() -> int:
                     help="run dir of finalised Model 1 @ 20pct")
     ap.add_argument("--m2_dir", default="m2_nocasual_a6",
                     help="run dir of finalised Model 2 @ a6")
+    ap.add_argument("--test_batch", default="",
+                    help="comma-separated batch(es) to evaluate BOTH models on as "
+                         "a fresh held-out set (e.g. audios7). Empty = each model "
+                         "on its own predictions.csv test set.")
+    ap.add_argument("--min_duration", type=float, default=30.0,
+                    help="(test_batch mode) drop eval rows shorter than this; "
+                         "default 30 matches how the models were trained.")
     ap.add_argument("--thr_step", type=float, default=0.01,
                     help="threshold sweep granularity (default 0.01 -> 101 rows)")
     args = ap.parse_args()
@@ -146,10 +226,12 @@ def main() -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     cache_path = Path(args.cache) if args.cache else (data_dir / "embeddings_cache.npz")
     runs_root = Path(args.runs_root)
+    test_batches = [b.strip() for b in args.test_batch.split(",") if b.strip()]
 
     log = setup_logging(out_dir / "log_final_eval.txt", name="final_eval")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    log.info("device=%s  runs_root=%s  cache=%s", device, runs_root, cache_path)
+    log.info("device=%s  runs_root=%s  cache=%s  test_batch=%s",
+             device, runs_root, cache_path, test_batches or "(own test sets)")
 
     models = [
         {"key": "model1_20pct", "title": "Model 1: default_last_pca98 (+casual) @ 20pct",
@@ -163,92 +245,75 @@ def main() -> int:
     summary_rows: list[dict] = []
     sheets: dict[str, pd.DataFrame] = {}
 
+    # In test_batch mode, load gt once and subset to the eval batch(es).
+    gt_eval = None
+    if test_batches:
+        gt = load_gt_and_filter(data_dir, args.min_duration, log)
+        gt_eval = gt[gt["batch"].astype(str).isin(test_batches)].copy()
+        gt_eval = gt_eval[gt_eval["label"].isin([0, 1])].reset_index(drop=True)
+        if len(gt_eval) == 0:
+            log.error("No labelled rows for batch(es) %s after min_duration=%.1f. "
+                      "Check the batch name / labels / cache.", test_batches, args.min_duration)
+            return 1
+        log.info("eval batch(es) %s: %d labelled rows (pos=%d) after min_duration=%.1f",
+                 test_batches, len(gt_eval), int((gt_eval["label"] == 1).sum()), args.min_duration)
+
     for spec in models:
         key, title = spec["key"], spec["title"]
+        var_dir = runs_root / spec["run_dir"] / spec["variant"]
+        meta_path = var_dir / "inference_meta.json"
+        meta0 = json.loads(meta_path.read_text()) if meta_path.exists() else {}
+        feat_order = meta0.get("feat_cols") or None
+        arch = ARCH_CONFIG[spec["arch"]]
         log.info("=" * 70)
         log.info("%s", title)
-        var_dir = runs_root / spec["run_dir"] / spec["variant"]
-        pred_path = var_dir / "predictions.csv"
-        if not pred_path.exists():
-            log.error("[%s] missing %s -- skipping. Re-export with --export_artifacts "
-                      "and --dump? Need predictions.csv.", key, pred_path)
-            continue
-        df = pd.read_csv(pred_path)
-        if "label" not in df.columns or "npy_filename" not in df.columns:
-            log.error("[%s] predictions.csv lacks label/npy_filename -- skipping", key)
-            continue
-        y = df["label"].to_numpy().astype(int)
 
-        # ORIG test features for these exact rows, then load weights + predict.
-        X_test_orig, n_feat = build_test_features(df, spec["layer"], cache_path, log)
-        arch = ARCH_CONFIG[spec["arch"]]
-        used_weights = (var_dir / "model.pt").exists()
-        if used_weights:
-            p, meta = load_and_predict(var_dir, X_test_orig, arch, device, log)
-            saved = df["pred_score"].to_numpy(float) if "pred_score" in df.columns else None
-            max_diff = float(np.max(np.abs(p - saved))) if saved is not None and len(saved) == len(p) else float("nan")
-            lvl = log.info if (max_diff != max_diff or max_diff < 1e-3) else log.warning
-            lvl("[%s] reproduced from model.pt: max|recon-saved pred_score| = %.2e "
-                "(<1e-3 => exact)", key, max_diff)
+        if not (var_dir / "model.pt").exists() and test_batches:
+            log.error("[%s] no model.pt at %s -- cannot evaluate a new batch without "
+                      "the weights. Re-export that run with --export_artifacts true.",
+                      key, var_dir)
+            continue
+
+        if test_batches:
+            # ---- mode B: fresh held-out batch, same weights ----
+            eval_label = "+".join(test_batches)
+            tag = f"{key}_on_{'_'.join(test_batches)}"
+            meta_df = gt_eval
+            y = gt_eval["label"].to_numpy().astype(int)
+            X, _ = build_features(meta_df, spec["layer"], cache_path, log, feat_order)
+            p, _ = load_and_predict(var_dir, X, arch, device, log)
+            used_weights, max_diff = True, float("nan")
         else:
-            log.warning("[%s] no model.pt at %s -- falling back to saved pred_score "
-                        "(metrics still valid, weights not re-run).", key, var_dir)
-            p = df["pred_score"].to_numpy(float)
-            meta, max_diff = {}, float("nan")
+            # ---- mode A: own predictions.csv test set ----
+            eval_label = f"own test ({spec['protocol']})"
+            tag = key
+            pred_path = var_dir / "predictions.csv"
+            if not pred_path.exists():
+                log.error("[%s] missing %s -- skipping.", key, pred_path)
+                continue
+            meta_df = pd.read_csv(pred_path)
+            if "label" not in meta_df.columns or "npy_filename" not in meta_df.columns:
+                log.error("[%s] predictions.csv lacks label/npy_filename -- skipping", key)
+                continue
+            y = meta_df["label"].to_numpy().astype(int)
+            X, _ = build_features(meta_df, spec["layer"], cache_path, log, feat_order)
+            if (var_dir / "model.pt").exists():
+                p, _ = load_and_predict(var_dir, X, arch, device, log)
+                saved = (meta_df["pred_score"].to_numpy(float)
+                         if "pred_score" in meta_df.columns else None)
+                max_diff = (float(np.max(np.abs(p - saved)))
+                            if saved is not None and len(saved) == len(p) else float("nan"))
+                lvl = log.info if (max_diff != max_diff or max_diff < 1e-3) else log.warning
+                lvl("[%s] reproduced from model.pt: max|recon-saved| = %.2e (<1e-3 => exact)",
+                    key, max_diff)
+                used_weights = True
+            else:
+                log.warning("[%s] no model.pt -- using saved pred_score (weights not re-run).", key)
+                p = meta_df["pred_score"].to_numpy(float)
+                used_weights, max_diff = False, float("nan")
 
-        m = compute_metrics(y, p)
-        n, npos, nneg = m["n"], m["n_pos"], m["n_neg"]
-        log.info("[%s] n=%d  pos=%d (%.1f%%)  AUC=%.4f AP=%.4f  best_f1=%.4f@%.2f",
-                 key, n, npos, 100 * npos / max(n, 1), m["auc"], m["ap"],
-                 m["best_f1"]["f1"], m["best_f1"]["threshold"])
-        log.info("[%s] recall@  p50=%.3f p80=%.3f p85=%.3f p90=%.3f p95=%.3f", key,
-                 _rap(m, "p50"), _rap(m, "p80"), _rap(m, "p85"),
-                 _rap(m, "p90"), _rap(m, "p95"))
-
-        best_thr = m["best_f1"]["threshold"]
-        preds_out = pd.DataFrame({
-            "npy_filename": df["npy_filename"].astype(str),
-            "group_id": df["group_id"].astype(str) if "group_id" in df.columns else "",
-            "question_id": df["question_id"] if "question_id" in df.columns else "",
-            "batch": df["batch"].astype(str) if "batch" in df.columns else "",
-            "region": df["region"].astype(str) if "region" in df.columns else "",
-            "label": y,
-            "pred_score": np.round(p, 6),
-            "saved_pred_score": (np.round(df["pred_score"].to_numpy(float), 6)
-                                 if "pred_score" in df.columns else np.nan),
-            "pred@best_thr": (p >= best_thr).astype(int),
-            "pred@0.5": (p >= 0.5).astype(int),
-            "pred@p90_thr": (p >= _rap(m, "p90", "threshold")).astype(int),
-        })
-        preds_out.to_csv(out_dir / f"predictions_{key}.csv", index=False)
-        sheets[f"{key}_preds"] = preds_out
-        sheets[f"{key}_sweep"] = threshold_sweep(y, p, args.thr_step)
-        rb = region_breakdown(df, y, p)
-        if len(rb):
-            sheets[f"{key}_by_region"] = rb
-
-        summary_rows.append({
-            "model": key, "title": title, "protocol": spec["protocol"],
-            "variant": spec["variant"], "run_dir": spec["run_dir"],
-            "used_weights": used_weights,
-            "repro_max_abs_diff": (round(max_diff, 8) if max_diff == max_diff else float("nan")),
-            "n_test": n, "n_pos": npos, "n_neg": nneg,
-            "prevalence": round(npos / max(n, 1), 4),
-            "auc": round(m["auc"], 4), "ap": round(m["ap"], 4),
-            "best_f1": round(m["best_f1"]["f1"], 4),
-            "best_thr": round(best_thr, 3),
-            "f1@0.5": round(m["thr0.5"]["f1"], 4),
-            "precision@0.5": round(m["thr0.5"].get("precision", float("nan")), 4),
-            "recall@0.5": round(m["thr0.5"].get("recall", float("nan")), 4),
-            "recall@p50": round(_rap(m, "p50"), 4),
-            "recall@p80": round(_rap(m, "p80"), 4),
-            "recall@p85": round(_rap(m, "p85"), 4),
-            "recall@p90": round(_rap(m, "p90"), 4),
-            "recall@p95": round(_rap(m, "p95"), 4),
-            "thr@p80": round(_rap(m, "p80", "threshold"), 3),
-            "thr@p90": round(_rap(m, "p90", "threshold"), 3),
-            "thr@p95": round(_rap(m, "p95", "threshold"), 3),
-        })
+        evaluate_and_record(tag, title, spec, meta_df, y, p, used_weights, max_diff,
+                            eval_label, out_dir, sheets, summary_rows, args.thr_step, log)
 
     if not summary_rows:
         log.error("No models evaluated. Check --runs_root/--m1_dir/--m2_dir.")
@@ -269,10 +334,15 @@ def main() -> int:
     except Exception as e:
         log.warning("could not write xlsx (%s); CSVs are saved. pip install openpyxl", e)
 
-    log.info("READING: 'summary' compares both finalised models at every operating "
-             "point; repro_max_abs_diff ~0 confirms the stored weights reproduce "
-             "the saved predictions. <model>_sweep gives the precision/recall "
-             "trade-off at each threshold; pick the row at your target precision.")
+    if test_batches:
+        log.info("READING: this is the SAME finalised weights scored on %s (data "
+                 "neither model trained on). Compare auc/ap/recall@p90 here vs the "
+                 "models' own-test numbers -- a big drop = the model does not "
+                 "generalise to this batch; similar = it holds up.", test_batches)
+    else:
+        log.info("READING: repro_max_abs_diff ~0 confirms the stored weights "
+                 "reproduce the saved predictions. <tag>_sweep gives precision/"
+                 "recall at each threshold -- pick the row at your target precision.")
     return 0
 
 

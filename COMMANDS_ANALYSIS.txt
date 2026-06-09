@@ -348,3 +348,30 @@ READING:
     the model trained on (wrong cache?) -- fix before trusting the numbers.
   * <model>_sweep: pick the row at your target precision (e.g. precision>=0.90)
     to read the recall + the exact threshold to deploy at.
+
+--------------------------------------------------------------------------------
+VALIDITY CHECK ON A NEW BATCH (same finalised weights, e.g. audios7 as test)
+--------------------------------------------------------------------------------
+Scores BOTH finalised models on a batch NEITHER trained on, to see if they
+generalise. Needs audios7 in gt.csv (with feat_*) AND in the BASE cache (run the
+add-a-batch + extract steps first). Uses the stored model.pt -- so the run dirs
+must have --export_artifacts true.
+
+python ec2/evaluate_final_models.py \
+    --data_dir  /home/ubuntu/nn/data \
+    --cache     /home/ubuntu/nn/data/embeddings_cache.npz \
+    --runs_root /home/ubuntu/nn/runs \
+    --out_dir   /home/ubuntu/nn/runs/final_eval_audios7 \
+    --test_batch audios7
+# --test_batch takes a comma list (audios7,audios8). --min_duration default 30
+#   matches training; pass --min_duration 0 to score every audios7 clip.
+
+OUTPUTS mirror the own-test run but tagged _on_audios7:
+  predictions_model1_20pct_on_audios7.csv , predictions_model2_a6_on_audios7.csv
+  evaluate_final_models.xlsx  sheets: summary, <model>_on_audios7_preds/_sweep/_by_region
+
+READING: compare auc / ap / recall@p90 on audios7 vs each model's own-test row.
+  Similar => the model holds up on new data; a big drop => it does not generalise
+  to audios7 (distribution shift). Features are built in the model's exact
+  training order (inference_meta.json feat_cols); an all-zero-features error means
+  those audios7 npy are not in the cache yet -- extract embeddings first.
