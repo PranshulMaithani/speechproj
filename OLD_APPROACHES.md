@@ -177,15 +177,65 @@ hand-built version of "fuse the acoustic model with the text model."
   of precision. A text-only variant (`--no-wav2vec2`) is supported for the case where the
   acoustic scores aren't available.
 
-### 2c. "XGBoost over the embeddings" — where that lives now
-In these **old** folders, XGBoost ran over **handcrafted features + acoustic *scores*** —
-not over the raw neural embedding vectors. The idea of running **XGBoost directly over the
-WavLM/Whisper embeddings** became part of the **current** pipeline:
-`ec2/xgboost_train.py` (companion to the neural baseline, writes `summary2.csv` so NN vs
-XGB are comparable on identical rows). Its variants include `wavlm_xgb` (768-d), `whisper_xgb`
-(1024-d), `everything_xgb` (WavLM+Whisper+feat_*), and weighted-average "picks". So the
-lineage is: **handcrafted-feature XGBoost (old) → feature+score ensemble (old2) →
-embedding XGBoost head (current).**
+### 2c. XGBoost over the embeddings — `ec2/xgboost_train.py` (the form you remember)
+In the **old** folders, XGBoost ran over **handcrafted features + the acoustic model's
+*scores*** (§2a, §2b) — not over the raw neural embedding vectors. The form you're thinking
+of — **XGBoost directly over the WavLM / Whisper embeddings** — is its descendant in the
+**current** pipeline: `ec2/xgboost_train.py`. It is the deliberate **gradient-boosted
+counterpart to the neural MLP head**, run on the *same* embeddings so the two model
+families can be compared head-to-head.
+
+**Apples-to-apples by construction.** It imports the exact same `_data_pipeline.py` helpers
+as `neural_baseline_train.py` — identical gt filter, identical candidate-disjoint splits
+(Mode A 20pct / Mode B a6), identical cache loader, identical metrics, identical ALLSTAR
+train-only and `--min_duration`. The NN writes `summary1.csv`, XGB writes `summary2.csv`,
+and because the rows are guaranteed identical you can read them side by side to answer
+*"does gradient boosting beat the MLP on these embeddings?"* It also carries the same
+`--per_client_standardize`, `--fewshot_frac`, `--use_augs` and `--class_balance` switches,
+so every experiment the MLP can run, the XGBoost can run on the same data.
+
+**"Tier A" variant catalogue.** Each base is an `XGBClassifier` on a different slice of the
+input vector; WavLM-bearing variants run once per layer in `{last, 9}`, the rest once
+(`wavlm_layer = n/a`):
+
+| Base | Input it consumes | Dim |
+|------|-------------------|-----|
+| `wavlm_xgb` | **WavLM mean-pool only** (per layer) | 768 |
+| `whisper_xgb` | **Whisper-medium encoder mean-pool only** | 1024 |
+| `everything_xgb` | **WavLM + Whisper + all feat_\*** (per layer) | ~1847 |
+| `text_all_xgb` | every `feat_*` column | 55 |
+| `text_stylo_xgb` | stylometric subset | ~15 |
+| `text_top20_xgb` | top-20 `feat_*` by XGB importance on TRAIN (orig) | 20 |
+
+**"Picks" = weighted-average late fusion.** Three hand-tuned blends of the base
+probabilities (threshold re-tuned on val), the direct heir of the old ensemble's
+"fuse the model outputs" idea — but now fusing *embedding-model* probabilities instead of
+the read-ratio score:
+- `tierA_pick1` = 0.20·text_top20 + 0.44·whisper + 0.36·wavlm
+- `tierA_pick2` = 0.50·text_all + 0.50·wavlm
+- `tierA_pick3` = 0.12·text_top20 + 0.16·text_stylo + 0.72·whisper
+
+**Mechanics worth knowing for the talk:**
+- **XGB config** (`_make_xgb`): 400 trees, `max_depth=4`, lr 0.05, subsample 0.8,
+  `colsample_bytree` 0.3 when >500 features (the embedding variants) else 0.8,
+  `min_child_weight=3`, `scale_pos_weight` for imbalance. Shallow, heavily-subsampled trees
+  because the input is high-dimensional and dense.
+- **Class balance** mirrors the NN's sampler: `--class_balance sampler` sets per-sample
+  weights to the sklearn "balanced" formula `N/(2·class_count)` so each class totals `N/2`
+  **and per-sample weights average 1.0** — a subtlety that matters because with `min_child_weight=3`
+  sub-unit weights would stop every split and pin AUC at 0.5.
+- **Augmentation** expands the train rows only for WavLM/Whisper-bearing variants;
+  text-only bases skip aug-expansion (a `feat_*` row doesn't change under audio aug, so
+  duplicating it would just overweight it).
+- **Threshold** is swept on **val** (not test), then the frozen threshold is applied to
+  test — the honest operating-point protocol, same as everywhere else in the project.
+
+**The full lineage, one line:** *handcrafted-feature XGBoost (`old/`) → feature + acoustic-score
+ensemble (`old2/`) → embedding XGBoost head run head-to-head against the MLP (`ec2/xgboost_train.py`).*
+The MLP head is what was **finalised** (the two models in `METHODOLOGY.md`);
+`xgboost_train.py` is run alongside it as the standing gradient-boosted baseline (its
+`summary2.csv` vs the NN's `summary1.csv`) so the head choice stays honest on identical
+rows. (A second iteration, `ec2/xgboost_train_v2.py`, also exists.)
 
 ---
 
