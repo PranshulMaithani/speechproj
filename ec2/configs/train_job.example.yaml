@@ -1,0 +1,49 @@
+# ============================================================================
+# train_pipeline.py job config (plug-and-play).
+#
+# Copy this file, tweak the fields, and run:
+#     python ec2/train_pipeline.py --config my_job.yaml --out_dir runs/my_job
+#
+# Any field here is overridable on the CLI, e.g. --seeds 42,43 --epochs 40.
+# Anything you omit falls back to train_pipeline.py's DEFAULTS.
+# ============================================================================
+
+# ---- paths -----------------------------------------------------------------
+data_dir: /home/ubuntu/nn/data            # folder holding gt.csv (+ feat_* cols)
+cache:    ""                              # embeddings_cache.npz; "" -> <data_dir>/embeddings_cache.npz
+out_dir:  /home/ubuntu/nn/runs/retrain_20pct
+audio_subdir: audio_npy                   # where Stage 0 looks for waveforms (laptop only)
+
+# ---- Stage 0: extraction (guarded; audio is laptop-only / PII) --------------
+do_extract: auto                          # auto | true | false
+wavlm_id:   microsoft/wavlm-base-plus     # only used if extraction actually runs
+whisper_id: openai/whisper-medium
+
+# ---- data selection --------------------------------------------------------
+train_batches:      [audios2, audios4, audios5, audios6]
+test_batches:       []                    # []  -> 20pct (Mode A) ; [audios6] -> a6 (Mode B)
+test_region_filter: ""                    # e.g. PHP to restrict the a6 test set
+train_only_batches: [casual]              # auxiliary data forced into TRAIN only
+use_augs:           all                   # all | noise,combo,... | "" (no augs)
+min_duration:       30.0                  # drop audios shorter than this (sec)
+use_text_features:  true                  # include the 55 feat_* handcrafted features
+per_client_standardize: false             # center each client's features (unsupervised)
+
+# ---- the variant grid ------------------------------------------------------
+# variants: 'all'  -> the canonical 30 (3 archs x 2 layers x 5 PCA)
+#           'grid' -> the archs x layers x pca cross product below
+#           explicit list -> e.g. [default_last_pca98, tiny_l9_pca95]
+variants: [default_last_pca98]
+archs:    [default, tiny, linear]         # used only when variants == grid
+layers:   [last, "9"]                     # used only when variants == grid
+pca:      [full, pca98, pca95, pca93, pca90]   # used only when variants == grid
+
+# ---- seeds (each reshuffles the split AND seeds init) -----------------------
+seeds: [42, 43, 44, 45, 46]
+
+# ---- training --------------------------------------------------------------
+class_balance: sampler                    # sampler | pos_weight | both | none
+batch_size: 64
+epochs:     60
+lr:         0.001
+thr_step:   0.01                          # threshold-workbook granularity
