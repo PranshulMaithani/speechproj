@@ -1,0 +1,103 @@
+================================================================================
+HOW TO RUN  ec2/aug_combo_ablation.py
+Exhaustive aug-combination ablation -- single seed, one finalised model.
+================================================================================
+
+WHAT IT DOES (one line)
+-----------------------
+Trains EVERY augmentation combination of size 3,4,5,6 (210 combos out of the 8
+augs) for ONE model on a FROZEN split, ranks them by test best-F1.
+
+
+PREREQUISITES
+-------------
+1. An embeddings cache built with all 8 augs + the WavLM layers the model uses:
+       augs   : noise, pitch, speed, gain, air, vtlp, combo, codec
+       layers : last (Model 1) and 9 (Model 2)
+   Confirm with the startup log line:  "augs in cache (8): [...]"
+   If fewer than 8 appear, re-run extract_embeddings.py with all 8 first.
+2. gt.csv (anonymized, with feat_* columns) in --data_dir.
+3. GPU strongly recommended (210 MLP trainings). CPU works but is slow.
+4. pip install openpyxl   (for the .xlsx; CSVs are written regardless)
+
+PII NOTE: this reads only gt.csv + the cache. No transcripts/audio needed.
+Safe to run on EC2.
+
+
+COMMANDS
+--------
+# Model 1  (default_last_pca98 + casual, 20pct split), seed 42, sizes 3-6:
+python ec2/aug_combo_ablation.py \
+    --data_dir /home/ubuntu/nn/data \
+    --cache    /home/ubuntu/nn/data/embeddings_cache.npz \
+    --out_dir  /home/ubuntu/nn/runs/aug_combo_m1 \
+    --model 1 --seed 42
+
+# Model 2  (tiny_l9_pca95, no casual, a6 split = test is all audios6):
+python ec2/aug_combo_ablation.py \
+    --data_dir /home/ubuntu/nn/data \
+    --cache    /home/ubuntu/nn/data/embeddings_cache.npz \
+    --out_dir  /home/ubuntu/nn/runs/aug_combo_m2 \
+    --model 2 --seed 42
+
+# Narrow to just sizes 3 and 4 (faster):
+    ... --sizes 3,4
+
+# Windows / laptop example (cache local):
+python ec2/aug_combo_ablation.py --data_dir "D:/.../data" --model 1 ^
+    --out_dir "D:/.../runs/aug_combo_m1"
+
+
+FLAGS
+-----
+--data_dir       REQUIRED. Folder with gt.csv (and the cache, unless --cache given).
+--out_dir        REQUIRED. Where results are written.
+--cache          embeddings_cache.npz. Default: <data_dir>/embeddings_cache.npz
+--model          1 or 2. Picks arch + layer + pca + split:
+                   1 -> default / last / pca98 / +casual / 20pct split
+                   2 -> tiny    / 9    / pca95 / no casual / a6 split (test=audios6)
+--seed           Single seed for BOTH the frozen split and the init (default 42).
+                 seed 42 + min_duration 30 reproduces the finalised split.
+--sizes          Combination sizes to enumerate (default "3,4,5,6").
+--min_duration   Drop audios shorter than this, seconds (default 30 = finalised).
+--batch_size     Default 64.
+--epochs         Default 60.
+--lr             Default 0.001.
+--class_balance  sampler | pos_weight | both | none   (default sampler).
+
+
+HOW MANY MODELS GET TRAINED
+---------------------------
+sizes 3,4,5,6 over 8 augs:  C(8,3)+C(8,4)+C(8,5)+C(8,6) = 56+70+56+28 = 210.
+One training each, single seed. On a typical GPU this is ~15-40 min total.
+(Restrict with --sizes to cut it down.)
+
+
+OUTPUTS  (in --out_dir; <m> = m1 or m2)
+---------------------------------------
+aug_combo_<m>_leaderboard.csv   ALL 210 ranked by test best-F1 (rank 1 = winner).
+aug_combo_<m>_by_size.csv       per size 3/4/5/6: count + mean/median/max F1 +
+                                the best subset of that size (shows whether more
+                                augs help).
+aug_combo_<m>_raw.csv           one row per combo: best-F1, threshold, f1@0.5,
+                                auc, ap, val_f1, recall@p80/85/90/95, in_dim.
+aug_combo_<m>.xlsx              leaderboard / by_size / raw as sheets.
+splits/<m>_seed<seed>.json      the frozen split's train/val/test candidate IDs.
+log_aug_combo_<m>.txt           full run log (prints TOP 15 + per-size at the end).
+
+
+HOW TO READ IT
+--------------
+* Open aug_combo_<m>_leaderboard.csv -- rank 1 is the best aug recipe by test
+  best-F1. Ties break toward FEWER augs, then higher AUC (simpler model wins).
+* aug_combo_<m>_by_size.csv tells you if size-6 actually beats size-3 on average
+  or if it's just noise -- compare mean_test_best_f1 across sizes.
+* Check test_recall@p90 / p95 on the top rows too: a combo with similar F1 but
+  higher recall at fixed precision is the better operating point.
+
+CAVEAT (important): this is a SINGLE seed on a FROZEN split -- a clean way to
+rank 210 recipes head-to-head, but it is ONE draw. Before finalising the winner,
+re-confirm it across seeds with:
+    aug_strategy_20pct.py   (5-seed split-reshuffled search)   or
+    aug_ablation.py         (frozen split, multi-seed average)
+================================================================================
