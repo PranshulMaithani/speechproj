@@ -252,6 +252,64 @@ threshold per row.
 
 ---
 
+## Picking a model — any variant is usable (not just M1/M2)
+
+**M1/M2 are a choice, not a limit.** A training run freezes **every** variant it trains
+(`neural_baseline_train.py` runs the full sweep; `train_pipeline.py` runs whatever `variants:`
+lists), each into its own self-describing folder:
+
+```
+<variant>/  →  model.pt · scaler.joblib · pca.joblib · inference_meta.json
+```
+
+At the artifact level all variants are equal — nothing marks one as "finalised." `M1`
+(`default_last_pca98`) and `M2` (`tiny_l9_pca95`) are known only by **convention** (the run-dir
+names), the **hardcoded specs in `evaluate_final_models.py`**, and **`METHODOLOGY.md` §6**.
+
+So in future retraining you can pick **any** variant's weights and use it — after evaluation:
+
+1. Read **`summary/summary_mean_std.csv`** — it ranks every variant by avg best-F1 ± std over
+   the seeds. High mean + low std = genuinely good, not a lucky seed.
+2. **Match the protocol to your use case:** in-domain (same client, you have labels) → the
+   20pct ranking, favour full-capacity; new client → the a6 ranking, favour the small /
+   layer-9 model (a big model on `last` memorises client identity). Skip the `linear`
+   variants — they're sanity baselines.
+3. Confirm the pick on held-out data with `evaluate_models.py`, then that folder **is** your
+   model. (Optionally copy it to a stable path like `runs/finalised/<variant>/`.)
+
+**Three guardrails so a swapped model "just works":**
+- **Move the whole folder as a unit** — the `scaler`/`pca` were fit on that run's train data;
+  never mix a `model.pt` with another run's scaler/PCA.
+- **Same feature schema at inference** — same base cache (same WavLM/Whisper IDs → same dims)
+  and the same 55 `feat_*` columns in the same order. This is enforced: `inference_meta.json`
+  stamps the dims + `feat_cols` and the loader checks `in_dim`, so a mismatch **errors** rather
+  than silently mispredicting.
+- **Re-check the decision threshold on the target data** — weights transfer cleanly, the
+  F1-optimal threshold may not (the cross-client caveat). Use the threshold sweep to set it.
+
+## Scoring one model — what `--models_root` is
+
+`--models_root` is the **directory `evaluate_models.py` searches** (recursively), not a file.
+It treats **every folder containing `model.pt` + `inference_meta.json`** as a model to score —
+that's how it can sweep many at once. To score just **one** model, point the root straight at
+a folder that holds that one bundle:
+
+```bash
+# runs/mypick/<variant>/  contains: model.pt, scaler.joblib, pca.joblib, inference_meta.json
+python ec2/evaluate_models.py \
+    --models_root runs/mypick \
+    --data_dir <DATA_DIR> --cache <BASE_CACHE> --test_batch audios7 \
+    --out_dir runs/eval_mypick
+```
+
+Or keep a shared root and narrow with the substring filter: `--models "default_l9_pca95/seed_42"`.
+The only requirement is the folder holds the **complete bundle** (`model.pt`, `scaler.joblib`,
+`inference_meta.json`, **and `pca.joblib` if the model used PCA**). `evaluate_models.py` does
+**not** care about the `runs_root`/`run_dir` training layout — only about finding
+`model.pt + inference_meta.json` under `--models_root`.
+
+---
+
 ## Quick decision guide
 
 - **New batch of audios?** → Part A Stage 1 (laptop) + upload, always. Then either Part A
