@@ -97,7 +97,7 @@ DEFAULTS = {
     "audio_subdir": "audio_npy",         # where extract reads waveforms
     # --- STAGE I: optional wav ingest (auto-detect audios<N>/ -> transcribe -> npy + gt.csv) ---
     "ingest": "auto",                    # auto (run if new folders/features) | true | false
-    "audio_root": "",                    # "" -> companylaptop/ ; holds audios<N>/ + audios<N>GT.csv
+    "audio_root": "",                    # "" -> data_dir (audios<N>/ live WITH the npy); or a path
     "transcribe_device": "cpu",          # cpu | cuda  (cuda = faster transcription)
     "transcribe_compute_type": "int8",   # faster-whisper compute type (cuda: float16)
     "transcribe_model": "",              # "" keeps the SAME model as audios2..6 (feature parity)
@@ -520,15 +520,16 @@ def _repo_run(cmd: list[str], desc: str, log, env: dict | None = None) -> None:
         raise SystemExit(f"[ingest] sub-stage FAILED ({desc}) exit code {r.returncode}")
 
 
-def ingest_stage(cfg: dict, log) -> bool:
+def ingest_stage(cfg: dict, log, data_dir: Path) -> bool:
     """STAGE I -- turn raw wavs into the anonymised gt.csv + npy the rest of the
     pipeline needs, only when there is something new to do.
 
     Auto-detects `audios<N>/` folders (each with a `<batch>GT.csv`) under
-    `audio_root` (default companylaptop/), transcribes any batch missing its
-    `<batch>_features.csv` (faster-whisper, CPU or GPU per `transcribe_device`),
-    then runs neural_baseline_prep to anonymise CID -> encoded id, write
-    `<PREP_UPLOAD>/{gt.csv, audio_npy/}` and keep `local/cid_mapping.json`.
+    `audio_root` (default = data_dir -- the raw audios live in the SAME dir as the
+    npy), transcribes any batch missing its `<batch>_features.csv` (faster-whisper,
+    CPU or GPU per `transcribe_device`), then runs neural_baseline_prep (pointed via
+    env at data_dir) to anonymise CID -> encoded id and write `data_dir/{gt.csv,
+    audio_npy/}`, keeping `data_dir/local/cid_mapping.json`.
 
     ingest = false -> never run (train from existing gt/cache).
     ingest = true  -> always run prep (transcribe only the batches missing features).
@@ -536,20 +537,20 @@ def ingest_stage(cfg: dict, log) -> bool:
                       missing its features csv; otherwise skip.
 
     PII: raw wavs never move downstream; only npy + gt.csv (anonymised) do, and the
-    real-id mapping stays local. Returns True if it (re)built gt/npy under
-    PREP_UPLOAD (so main() reads from there)."""
+    real-id mapping stays local. Returns True if it (re)built gt/npy in data_dir."""
     mode = str(cfg["ingest"]).lower()
     if mode == "false":
         log.info("[ingest] ingest=false -> training from existing gt/cache")
         return False
-    audio_root = Path(cfg["audio_root"]) if str(cfg["audio_root"]).strip() else COMPANYLAPTOP
+    # audios<N>/ live WITH the npy (in data_dir) unless audio_root is set explicitly.
+    audio_root = Path(cfg["audio_root"]) if str(cfg["audio_root"]).strip() else data_dir
     discovered = discover_batches(audio_root)
     if not discovered:
         log.info("[ingest] no audios<N>/ + <batch>GT.csv under %s -> nothing to ingest "
                  "(training from existing gt/cache)", audio_root)
         return False
 
-    gt_path = PREP_UPLOAD / "gt.csv"
+    gt_path = data_dir / "gt.csv"
     existing: set[str] = set()
     if gt_path.exists():
         try:
@@ -572,11 +573,17 @@ def ingest_stage(cfg: dict, log) -> bool:
     import os
     keep = str(cfg["keep_questions"]).strip() or "25,26,27"
     prune = bool(cfg["prune_questions"])
-    # pass the question filter down so ONLY these qids get transcribed + npy'd ->
-    # embeddings (audios<N>/<ciid>/<ciid>_<q>.wav is nested; both sub-scripts rglob).
-    sub_env = {**os.environ, "KEEP_QUESTIONS": keep}
-    log.info("[ingest] PII: raw wavs stay put; CID -> encoded id + local cid_mapping.json; "
-             "only npy + gt.csv move downstream.")
+    # Point prep at data_dir so raw audios, npy, and gt.csv all live together (the
+    # npy location), and pass the question filter so ONLY Q25/26/27 get transcribed +
+    # npy'd -> embeddings (audios<N>/<ciid>/<ciid>_<q>.wav is nested; sub-scripts rglob).
+    sub_env = {**os.environ,
+               "KEEP_QUESTIONS": keep,
+               "PREP_AUDIO_ROOT": str(audio_root),       # where audios<N>/ + GT (+ features) live
+               "PREP_UPLOAD_DIR": str(data_dir),          # gt.csv + audio_npy/ land here (with the npy)
+               "PREP_LOCAL_DIR": str(data_dir / "local")}  # cid_mapping.json stays LOCAL here
+    log.info("[ingest] PII: raw wavs stay put; CID -> encoded id + %s/local/cid_mapping.json; "
+             "only npy + gt.csv move downstream.", data_dir)
+    log.info("[ingest] audio_root=%s  ->  npy+gt in data_dir=%s", audio_root, data_dir)
     log.info("[ingest] keep_questions=%s  prune_questions=%s", keep, prune)
     to_transcribe = discovered if retr else need_feats
 
@@ -632,11 +639,13 @@ def main() -> int:
     log.info("resolved config -> %s", out_dir / "config_resolved.json")
 
     # ---- STAGE I: optional wav ingest (auto-detect + transcribe + anonymise) ----
-    ran_ingest = ingest_stage(cfg, log)
-    data_dir = PREP_UPLOAD if ran_ingest else Path(cfg["data_dir"])
-    cfg["data_dir"] = str(data_dir)          # keep cfg consistent (Stage 0 reads it)
+    # data_dir is the single working location: audios<N>/ live here (audio_root
+    # defaults to it) and prep writes gt.csv + audio_npy/ here too -- so raw audio
+    # and npy sit together, the way the npy have always been stored.
+    data_dir = Path(cfg["data_dir"])
+    ran_ingest = ingest_stage(cfg, log, data_dir)
     cache_path = Path(cfg["cache"]) if cfg["cache"] else (data_dir / "embeddings_cache.npz")
-    log.info("data_dir = %s", data_dir)
+    log.info("data_dir = %s  (ingest ran: %s)", data_dir, ran_ingest)
     log.info("cache    = %s", cache_path)
 
     # variant grid + the WavLM layers it needs

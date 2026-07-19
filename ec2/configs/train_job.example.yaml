@@ -17,9 +17,9 @@ out_dir:  /home/ubuntu/nn/runs/retrain_20pct
 audio_subdir: audio_npy                   # where Stage 0 looks for waveforms
 
 # ---- STAGE I: wav ingest (auto-detect audios<N>/ -> transcribe -> npy + gt) --
-# Drop audios<N>/ + audios<N>GT.csv in companylaptop/ and this auto-picks them up.
+# Put audios<N>/ + audios<N>GT.csv in the DATA DIR (where the npy live); auto-detected.
 ingest: auto                              # auto (run if new folders/features) | true | false
-audio_root: ""                            # "" -> companylaptop/ ; holds audios<N>/ + GT csvs
+audio_root: ""                            # "" -> data_dir (audios live WITH the npy); or a path
 transcribe_device: cpu                    # cpu | cuda   (cuda = faster transcription)
 transcribe_compute_type: int8             # faster-whisper compute type (cuda: float16)
 transcribe_model: ""                      # "" keeps the SAME model as audios2..6 (feature parity)

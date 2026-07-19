@@ -12,13 +12,18 @@ only `.npy` + `gt.csv` move downstream. Raw wavs never move.
 ---
 
 ## Where to put your data (modular — no code edits to add a batch)
-Drop, side by side, **inside `companylaptop/`** (or set `audio_root`):
+Put the raw audios **in the same `data_dir` where the npy live** (raw audio and npy sit
+together; `audio_root` defaults to `data_dir`). Drop, side by side under `<data_dir>/`:
 ```
-companylaptop/audios<N>/<ciid>/<ciid>_<q>.wav   ← raw audio (nested per-candidate, q=1..27)
-companylaptop/audios<N>GT.csv                   ← columns: filename,label[,region]
+<data_dir>/audios<N>/<ciid>/<ciid>_<q>.wav   ← raw audio (nested per-candidate, q=1..27)
+<data_dir>/audios<N>GT.csv                   ← columns: filename,label[,region]
+<data_dir>/audio_npy/*.npy                   ← npy (prep writes here — where they've always been)
+<data_dir>/gt.csv                            ← gt (prep writes here)
+<data_dir>/local/cid_mapping.json            ← real CID → encoded id (kept LOCAL)
 ```
 Both flat (`audios<N>/<cid>_<q>.wav`) and nested (`audios<N>/<ciid>/<ciid>_<q>.wav`) layouts
-work — the scripts recurse. The GT `filename` is the basename (e.g. `ciid_25.wav`).
+work — the scripts recurse. The GT `filename` is the basename (e.g. `ciid_25.wav`). Set
+`audio_root` only if the raw audios live somewhere other than `data_dir`.
 
 **Question filter (only Q25/26/27):** the per-audio system uses questions 25/26/27, so
 `keep_questions` (default `"25,26,27"`) makes **only those become npy → embeddings**; other

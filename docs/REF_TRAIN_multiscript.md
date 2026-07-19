@@ -24,6 +24,12 @@ Drop, side by side, **inside `companylaptop/`** (flat or nested both work — th
 companylaptop/audios<N>/<ciid>/<ciid>_<q>.wav   ← raw audio (nested per-candidate, q=1..27)
 companylaptop/audios<N>GT.csv                   ← columns: filename,label[,region]
 ```
+By default these live in `companylaptop/`. To instead keep them in the **data dir** (with the
+npy — as the unified `train_pipeline.py` does), set env vars: `PREP_AUDIO_ROOT=<data_dir>`
+(read by prep) + `--audio_root <data_dir>` (for `extract_features_batch.py`), and
+`PREP_UPLOAD_DIR=<data_dir>` / `PREP_LOCAL_DIR=<data_dir>/local` so prep writes `gt.csv` +
+`audio_npy/` there and keeps `cid_mapping.json` local.
+
 **Only Q25/26/27 are processed** (→ npy → embeddings). `extract_features_batch.py` and
 `neural_baseline_prep.py` read the env var `KEEP_QUESTIONS` (default `25,26,27`; set
 `KEEP_QUESTIONS=all` to keep every question). To reclaim disk, delete the other questions

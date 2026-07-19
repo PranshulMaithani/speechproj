@@ -60,8 +60,16 @@ from text_features import TEXT_FEATURE_NAMES, compute_text_features
 # AUDIO_ROOT defaults to the directory this script lives in, which is
 # `companylaptop/` per the existing project layout. All audios2..audios6
 # folders and <batch>GT.csv files are siblings of this script.
-AUDIO_ROOT = Path(__file__).resolve().parent
-OUTPUT_ROOT = AUDIO_ROOT.parent / "data" / "neural_prep_out"
+import os
+# Paths are env-overridable so the pipeline can keep the raw audios<N>/ AND the
+# npy/gt in the SAME data dir (where the npy have lived since training began),
+# instead of companylaptop/. Direct runs with no env still default to companylaptop.
+#   PREP_AUDIO_ROOT  -> where audios<N>/ + <batch>GT.csv (+ features.csv) live
+#   PREP_UPLOAD_DIR  -> where gt.csv + audio_npy/ are written (default: OUTPUT_ROOT/upload)
+#   PREP_LOCAL_DIR   -> where cid_mapping.json stays LOCAL (default: OUTPUT_ROOT/local)
+AUDIO_ROOT = Path(os.environ.get("PREP_AUDIO_ROOT") or Path(__file__).resolve().parent)
+OUTPUT_ROOT = Path(os.environ.get("PREP_OUTPUT_ROOT")
+                   or (AUDIO_ROOT.parent / "data" / "neural_prep_out"))
 
 # Baseline batches always considered. main() also AUTO-DISCOVERS any other
 # audios<N>/ folder that has a sibling <batch>GT.csv (see discover_batches), so a
@@ -340,8 +348,8 @@ def load_and_resample(src: Path, target_sr: int, max_dur: float | None) -> np.nd
 # ----------------------------------------------------------------------------
 
 def main() -> int:
-    upload_dir = OUTPUT_ROOT / "upload"
-    local_dir = OUTPUT_ROOT / "local"
+    upload_dir = Path(os.environ.get("PREP_UPLOAD_DIR") or (OUTPUT_ROOT / "upload"))
+    local_dir = Path(os.environ.get("PREP_LOCAL_DIR") or (OUTPUT_ROOT / "local"))
     npy_dir = upload_dir / "audio_npy"
     npy_dir.mkdir(parents=True, exist_ok=True)
     local_dir.mkdir(parents=True, exist_ok=True)
