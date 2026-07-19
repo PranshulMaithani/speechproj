@@ -185,8 +185,12 @@ More aug-ablation examples: `COMMANDS_AUG_SAMPLES.txt`.
 
 # PART B — Unified flow (`train_pipeline.py` + `evaluate_models.py`)
 
-Same **Stage 1 (laptop) and the upload** as Part A — nothing changes there. The unified
-scripts replace **Stages 2–5 on EC2**:
+`train_pipeline.py` is now a **single universal script**: it can optionally fold in Stage 1
+itself (its **Stage I ingest** auto-detects `audios<N>/` folders, transcribes new ones on
+CPU **or GPU**, and anonymises → npy + gt.csv), or skip that and train from an existing
+gt+cache. So Part B is either "drop wavs and run one command" (jump server) or "train from
+cache" (EC2, `ingest: false`). Full field list: `docs/REF_TRAIN_uniscript.md`. The unified
+scripts replace **Stages 2–5 on EC2** (and optionally Stage 1):
 
 | Legacy (Part A) | Unified (Part B) |
 |---|---|

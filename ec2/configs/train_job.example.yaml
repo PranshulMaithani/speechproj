@@ -9,12 +9,23 @@
 # ============================================================================
 
 # ---- paths -----------------------------------------------------------------
-data_dir: /home/ubuntu/nn/data            # folder holding gt.csv (+ feat_* cols)
+# data_dir holds gt.csv (+ feat_* cols) + audio_npy/. Leave the default to use the
+# wav-ingest output (data/neural_prep_out/upload); set it for a ready EC2 data dir.
+data_dir: /home/ubuntu/nn/data
 cache:    ""                              # embeddings_cache.npz; "" -> <data_dir>/embeddings_cache.npz
 out_dir:  /home/ubuntu/nn/runs/retrain_20pct
-audio_subdir: audio_npy                   # where Stage 0 looks for waveforms (laptop only)
+audio_subdir: audio_npy                   # where Stage 0 looks for waveforms
 
-# ---- Stage 0: extraction (guarded; audio is laptop-only / PII) --------------
+# ---- STAGE I: wav ingest (auto-detect audios<N>/ -> transcribe -> npy + gt) --
+# Drop audios<N>/ + audios<N>GT.csv in companylaptop/ and this auto-picks them up.
+ingest: auto                              # auto (run if new folders/features) | true | false
+audio_root: ""                            # "" -> companylaptop/ ; holds audios<N>/ + GT csvs
+transcribe_device: cpu                    # cpu | cuda   (cuda = faster transcription)
+transcribe_compute_type: int8             # faster-whisper compute type (cuda: float16)
+transcribe_model: ""                      # "" keeps the SAME model as audios2..6 (feature parity)
+retranscribe: false                       # re-transcribe every discovered batch (--force)
+
+# ---- Stage 0: WavLM/Whisper embedding extraction (guarded, incremental) ------
 do_extract: auto                          # auto | true | false
 wavlm_id:   microsoft/wavlm-base-plus     # only used if extraction actually runs
 whisper_id: openai/whisper-medium

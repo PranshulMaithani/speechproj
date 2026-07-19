@@ -76,6 +76,10 @@ from neural_baseline_multiseed import derive_model_seed
 from evaluate_final_models import threshold_sweep
 
 THIS_DIR = Path(__file__).resolve().parent
+REPO_ROOT = THIS_DIR.parent
+COMPANYLAPTOP = REPO_ROOT / "companylaptop"        # extract_features_batch + neural_baseline_prep
+PREP_UPLOAD = REPO_ROOT / "data" / "neural_prep_out" / "upload"   # prep writes gt.csv + audio_npy here
+DEFAULT_OUT = REPO_ROOT / "data" / "runs" / "train"
 
 # Canonical aug set used ONLY for cold-start extraction (no cache yet, use_augs:
 # all). Matches extract_embeddings.build_augmenters; extract drops any that the
@@ -88,8 +92,17 @@ DEFAULT_AUG_SET = ["noise", "pitch", "speed", "gain", "air", "vtlp", "combo", "c
 # ----------------------------------------------------------------------------
 
 DEFAULTS = {
-    "data_dir": None, "cache": "", "out_dir": None,
-    "audio_subdir": "audio_npy",         # where extract reads waveforms (laptop only)
+    "data_dir": str(PREP_UPLOAD),        # gt.csv + audio_npy/ (prep's output; override for EC2)
+    "cache": "", "out_dir": str(DEFAULT_OUT),
+    "audio_subdir": "audio_npy",         # where extract reads waveforms
+    # --- STAGE I: optional wav ingest (auto-detect audios<N>/ -> transcribe -> npy + gt.csv) ---
+    "ingest": "auto",                    # auto (run if new folders/features) | true | false
+    "audio_root": "",                    # "" -> companylaptop/ ; holds audios<N>/ + audios<N>GT.csv
+    "transcribe_device": "cpu",          # cpu | cuda  (cuda = faster transcription)
+    "transcribe_compute_type": "int8",   # faster-whisper compute type (cuda: float16)
+    "transcribe_model": "",              # "" keeps the SAME model as audios2..6 (feature parity)
+    "retranscribe": False,               # re-transcribe every discovered batch (--force)
+    # --- embeddings ---
     "do_extract": "auto",                # auto | true | false
     "wavlm_id": "microsoft/wavlm-base-plus",
     "whisper_id": "openai/whisper-medium",
@@ -165,11 +178,11 @@ def load_config() -> dict:
         cfg[key] = float(cfg[key])
     for key in ("batch_size", "epochs"):
         cfg[key] = int(cfg[key])
-    for key in ("use_text_features", "per_client_standardize"):
+    for key in ("use_text_features", "per_client_standardize", "retranscribe"):
         cfg[key] = str(cfg[key]).lower() in ("1", "true", "yes")
     cfg["test_region_filter"] = (str(cfg["test_region_filter"]).strip() or None)
-    if not cfg["data_dir"] or not cfg["out_dir"]:
-        ap.error("--data_dir and --out_dir are required (in YAML or CLI)")
+    if not cfg["out_dir"]:
+        ap.error("--out_dir is required (in YAML or CLI)")
     return cfg
 
 
@@ -477,30 +490,133 @@ def build_threshold_workbook(var_dir: Path, variant: str, seeds: list[int],
 
 
 # ----------------------------------------------------------------------------
+# Stage I: optional wav ingest (auto-detect folders -> transcribe -> npy + gt).
+# ----------------------------------------------------------------------------
+
+def discover_batches(audio_root: Path) -> list[str]:
+    """Every `audios<N>/` under audio_root that has a sibling `<batch>GT.csv`,
+    numerically ordered. Mirrors neural_baseline_prep's own discovery so 'drop a
+    folder + its GT csv and re-run' works with zero code edits."""
+    out = []
+    for d in sorted(audio_root.glob("audios*")):
+        if d.is_dir() and (audio_root / f"{d.name}GT.csv").exists():
+            out.append(d.name)
+    out.sort(key=lambda b: (int(b[6:]) if b[6:].isdigit() else 10**9, b))
+    return out
+
+
+def _repo_run(cmd: list[str], desc: str, log) -> None:
+    """Run one ingest sub-stage as a subprocess from the repo root, and stop the
+    whole pipeline loudly if it fails (so we never train on stale/partial data)."""
+    log.info("-" * 70)
+    log.info("[ingest] %s", desc)
+    log.info("[ingest] $ %s", " ".join(str(c) for c in cmd))
+    r = subprocess.run(cmd, cwd=str(REPO_ROOT))
+    if r.returncode != 0:
+        raise SystemExit(f"[ingest] sub-stage FAILED ({desc}) exit code {r.returncode}")
+
+
+def ingest_stage(cfg: dict, log) -> bool:
+    """STAGE I -- turn raw wavs into the anonymised gt.csv + npy the rest of the
+    pipeline needs, only when there is something new to do.
+
+    Auto-detects `audios<N>/` folders (each with a `<batch>GT.csv`) under
+    `audio_root` (default companylaptop/), transcribes any batch missing its
+    `<batch>_features.csv` (faster-whisper, CPU or GPU per `transcribe_device`),
+    then runs neural_baseline_prep to anonymise CID -> encoded id, write
+    `<PREP_UPLOAD>/{gt.csv, audio_npy/}` and keep `local/cid_mapping.json`.
+
+    ingest = false -> never run (train from existing gt/cache).
+    ingest = true  -> always run prep (transcribe only the batches missing features).
+    ingest = auto  -> run only if a discovered batch is new (not in gt.csv) or is
+                      missing its features csv; otherwise skip.
+
+    PII: raw wavs never move downstream; only npy + gt.csv (anonymised) do, and the
+    real-id mapping stays local. Returns True if it (re)built gt/npy under
+    PREP_UPLOAD (so main() reads from there)."""
+    mode = str(cfg["ingest"]).lower()
+    if mode == "false":
+        log.info("[ingest] ingest=false -> training from existing gt/cache")
+        return False
+    audio_root = Path(cfg["audio_root"]) if str(cfg["audio_root"]).strip() else COMPANYLAPTOP
+    discovered = discover_batches(audio_root)
+    if not discovered:
+        log.info("[ingest] no audios<N>/ + <batch>GT.csv under %s -> nothing to ingest "
+                 "(training from existing gt/cache)", audio_root)
+        return False
+
+    gt_path = PREP_UPLOAD / "gt.csv"
+    existing: set[str] = set()
+    if gt_path.exists():
+        try:
+            existing = set(pd.read_csv(gt_path, usecols=["batch"])["batch"].astype(str))
+        except Exception:
+            existing = set()
+    need_feats = [b for b in discovered if not (audio_root / f"{b}_features.csv").exists()]
+    new_batches = [b for b in discovered if b not in existing]
+    retr = bool(cfg["retranscribe"])
+    log.info("=" * 78)
+    log.info("STAGE I  INGEST (auto-detect -> transcribe -> anonymise -> npy + gt)")
+    log.info("[ingest] audio_root=%s  discovered=%s", audio_root, discovered)
+    log.info("[ingest] new(not in gt)=%s  missing_features=%s  retranscribe=%s",
+             new_batches, need_feats, retr)
+
+    if mode == "auto" and not new_batches and not need_feats and not retr:
+        log.info("[ingest] auto: nothing new -> skip transcription/prep, use existing gt")
+        return False
+
+    log.info("[ingest] PII: raw wavs stay put; CID -> encoded id + local cid_mapping.json; "
+             "only npy + gt.csv move downstream.")
+    to_transcribe = discovered if retr else need_feats
+    for b in to_transcribe:
+        cmd = [sys.executable, str(COMPANYLAPTOP / "extract_features_batch.py"),
+               "--batch", b, "--audio_root", str(audio_root),
+               "--device", str(cfg["transcribe_device"]),
+               "--compute_type", str(cfg["transcribe_compute_type"])]
+        if str(cfg["transcribe_model"]).strip():
+            cmd += ["--model", str(cfg["transcribe_model"]).strip()]
+        if retr:
+            cmd += ["--force"]
+        _repo_run(cmd, f"transcribe + 55 features :: {b}  ({cfg['transcribe_device']})", log)
+    # prep takes no CLI args -- it auto-discovers batches under companylaptop/ and
+    # writes the anonymised gt.csv + npy to PREP_UPLOAD.
+    _repo_run([sys.executable, str(COMPANYLAPTOP / "neural_baseline_prep.py")],
+              "anonymise -> encoded id + npy + gt.csv (all discovered batches)", log)
+    return True
+
+
+# ----------------------------------------------------------------------------
 # Main.
 # ----------------------------------------------------------------------------
 
 def main() -> int:
-    """Drive the five stages end to end: resolve config, run the coverage/extract
-    pre-flight (stage 0), load gt+cache (1), build per-seed splits (2), train every
-    variant x seed and export full artifacts incl. val+test predictions (3),
-    aggregate into per_run/summary/best_models (4), and write the per-variant
-    threshold workbooks (5). Returns a process exit code (0 on success)."""
+    """Drive the pipeline end to end: resolve config; STAGE I optionally ingests raw
+    wavs (auto-detect folders -> transcribe -> anonymise -> npy + gt.csv); then the
+    coverage/extract pre-flight (stage 0), load gt+cache (1), per-seed splits (2),
+    train every variant x seed exporting full artifacts + val/test predictions (3),
+    aggregate into per_run/summary/best_models (4), and per-variant threshold
+    workbooks (5). Returns a process exit code (0 on success)."""
     cfg = load_config()
-    data_dir = Path(cfg["data_dir"])
     out_dir = Path(cfg["out_dir"])
     (out_dir / "models").mkdir(parents=True, exist_ok=True)
     (out_dir / "splits").mkdir(parents=True, exist_ok=True)
     (out_dir / "summary").mkdir(parents=True, exist_ok=True)
-    cache_path = Path(cfg["cache"]) if cfg["cache"] else (data_dir / "embeddings_cache.npz")
 
     log = setup_logging(out_dir / "log_train.txt", name="pipeline")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     mode = "a6" if cfg["test_batches"] else "20pct"
-    log.info("UNIFIED RETRAINING PIPELINE   device=%s  mode=%s", device, mode)
+    log.info("UNIFIED TRAIN PIPELINE   device=%s  mode=%s", device, mode)
     with (out_dir / "config_resolved.json").open("w") as f:
         json.dump(cfg, f, indent=2, default=str)
     log.info("resolved config -> %s", out_dir / "config_resolved.json")
+
+    # ---- STAGE I: optional wav ingest (auto-detect + transcribe + anonymise) ----
+    ran_ingest = ingest_stage(cfg, log)
+    data_dir = PREP_UPLOAD if ran_ingest else Path(cfg["data_dir"])
+    cfg["data_dir"] = str(data_dir)          # keep cfg consistent (Stage 0 reads it)
+    cache_path = Path(cfg["cache"]) if cfg["cache"] else (data_dir / "embeddings_cache.npz")
+    log.info("data_dir = %s", data_dir)
+    log.info("cache    = %s", cache_path)
 
     # variant grid + the WavLM layers it needs
     grid = build_grid(cfg, log)
