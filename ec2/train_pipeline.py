@@ -102,6 +102,8 @@ DEFAULTS = {
     "transcribe_compute_type": "int8",   # faster-whisper compute type (cuda: float16)
     "transcribe_model": "",              # "" keeps the SAME model as audios2..6 (feature parity)
     "retranscribe": False,               # re-transcribe every discovered batch (--force)
+    "keep_questions": "25,26,27",         # only these qids -> npy -> embeddings ('all' = every question)
+    "prune_questions": False,            # DELETE non-keep wavs to save space (irreversible; opt-in)
     # --- embeddings ---
     "do_extract": "auto",                # auto | true | false
     "wavlm_id": "microsoft/wavlm-base-plus",
@@ -178,7 +180,8 @@ def load_config() -> dict:
         cfg[key] = float(cfg[key])
     for key in ("batch_size", "epochs"):
         cfg[key] = int(cfg[key])
-    for key in ("use_text_features", "per_client_standardize", "retranscribe"):
+    for key in ("use_text_features", "per_client_standardize", "retranscribe",
+                "prune_questions"):
         cfg[key] = str(cfg[key]).lower() in ("1", "true", "yes")
     cfg["test_region_filter"] = (str(cfg["test_region_filter"]).strip() or None)
     if not cfg["out_dir"]:
@@ -505,13 +508,14 @@ def discover_batches(audio_root: Path) -> list[str]:
     return out
 
 
-def _repo_run(cmd: list[str], desc: str, log) -> None:
+def _repo_run(cmd: list[str], desc: str, log, env: dict | None = None) -> None:
     """Run one ingest sub-stage as a subprocess from the repo root, and stop the
-    whole pipeline loudly if it fails (so we never train on stale/partial data)."""
+    whole pipeline loudly if it fails (so we never train on stale/partial data).
+    `env` (if given) fully replaces the child environment -- pass {**os.environ, ...}."""
     log.info("-" * 70)
     log.info("[ingest] %s", desc)
     log.info("[ingest] $ %s", " ".join(str(c) for c in cmd))
-    r = subprocess.run(cmd, cwd=str(REPO_ROOT))
+    r = subprocess.run(cmd, cwd=str(REPO_ROOT), env=env)
     if r.returncode != 0:
         raise SystemExit(f"[ingest] sub-stage FAILED ({desc}) exit code {r.returncode}")
 
@@ -565,9 +569,25 @@ def ingest_stage(cfg: dict, log) -> bool:
         log.info("[ingest] auto: nothing new -> skip transcription/prep, use existing gt")
         return False
 
+    import os
+    keep = str(cfg["keep_questions"]).strip() or "25,26,27"
+    prune = bool(cfg["prune_questions"])
+    # pass the question filter down so ONLY these qids get transcribed + npy'd ->
+    # embeddings (audios<N>/<ciid>/<ciid>_<q>.wav is nested; both sub-scripts rglob).
+    sub_env = {**os.environ, "KEEP_QUESTIONS": keep}
     log.info("[ingest] PII: raw wavs stay put; CID -> encoded id + local cid_mapping.json; "
              "only npy + gt.csv move downstream.")
+    log.info("[ingest] keep_questions=%s  prune_questions=%s", keep, prune)
     to_transcribe = discovered if retr else need_feats
+
+    # optional: DELETE non-keep wavs first (irreversible; only when prune_questions:true)
+    if prune:
+        for b in to_transcribe:
+            _repo_run([sys.executable, str(COMPANYLAPTOP / "prune_questions.py"),
+                       "--batch", b, "--audio_root", str(audio_root),
+                       "--keep", keep, "--apply"],
+                      f"PRUNE non-keep questions (delete) :: {b}", log)
+
     for b in to_transcribe:
         cmd = [sys.executable, str(COMPANYLAPTOP / "extract_features_batch.py"),
                "--batch", b, "--audio_root", str(audio_root),
@@ -577,11 +597,12 @@ def ingest_stage(cfg: dict, log) -> bool:
             cmd += ["--model", str(cfg["transcribe_model"]).strip()]
         if retr:
             cmd += ["--force"]
-        _repo_run(cmd, f"transcribe + 55 features :: {b}  ({cfg['transcribe_device']})", log)
+        _repo_run(cmd, f"transcribe + 55 features :: {b}  ({cfg['transcribe_device']})",
+                  log, env=sub_env)
     # prep takes no CLI args -- it auto-discovers batches under companylaptop/ and
-    # writes the anonymised gt.csv + npy to PREP_UPLOAD.
+    # writes the anonymised gt.csv + npy to PREP_UPLOAD (KEEP_QUESTIONS via env).
     _repo_run([sys.executable, str(COMPANYLAPTOP / "neural_baseline_prep.py")],
-              "anonymise -> encoded id + npy + gt.csv (all discovered batches)", log)
+              "anonymise -> encoded id + npy + gt.csv (only kept questions)", log, env=sub_env)
     return True
 
 

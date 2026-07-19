@@ -18,10 +18,18 @@ EC2:     extract_embeddings.py  →  neural_baseline_multiseed.py (pick arch)
 
 ## Where to put your data (the modular convention)
 
-Drop, side by side, **inside `companylaptop/`**:
+Drop, side by side, **inside `companylaptop/`** (flat or nested both work — the scripts
+`rglob`):
 ```
-companylaptop/audios<N>/<realCID>_<qid>.wav     ← raw audio, flat folder
+companylaptop/audios<N>/<ciid>/<ciid>_<q>.wav   ← raw audio (nested per-candidate, q=1..27)
 companylaptop/audios<N>GT.csv                   ← columns: filename,label[,region]
+```
+**Only Q25/26/27 are processed** (→ npy → embeddings). `extract_features_batch.py` and
+`neural_baseline_prep.py` read the env var `KEEP_QUESTIONS` (default `25,26,27`; set
+`KEEP_QUESTIONS=all` to keep every question). To reclaim disk, delete the other questions
+with `companylaptop/prune_questions.py` (dry-run by default; `--apply` to delete):
+```bash
+python companylaptop/prune_questions.py --batch audios8 --apply
 ```
 `label` accepts `read/cheating/scripted/yes/1` → **1 (cheat)** and
 `spontaneous/genuine/no/0` → **0**. Adding audios8, audios9, … needs **no code change** —

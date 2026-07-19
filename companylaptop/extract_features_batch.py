@@ -425,9 +425,42 @@ def compute_all_features(fp, text, words):
 # Stage 1: transcription -> <batch>_transcripts.json (rich, word-timestamped).
 # ----------------------------------------------------------------------------
 
+# Only these question ids are processed. The per-audio cheating system operates on
+# Q25/26/27, so we never transcribe the rest (saves time). Override with the env var
+# KEEP_QUESTIONS="all" (process every question) or e.g. "25,26,27".
+_QID_TAIL_RE = re.compile(r"_(\d{1,3})$")
+
+
+def _keep_questions() -> set[int] | None:
+    """Parse env KEEP_QUESTIONS -> the set of qids to keep, or None for 'all'."""
+    import os
+    raw = os.environ.get("KEEP_QUESTIONS", "25,26,27").strip().lower()
+    if raw in ("", "all", "none"):
+        return None
+    return {int(x) for x in raw.split(",") if x.strip().isdigit()}
+
+
+def _qid_of(stem: str) -> int | None:
+    """Trailing question id from a '<cid>_<qid>' filename stem (e.g. ciid_25 -> 25)."""
+    m = _QID_TAIL_RE.search(stem)
+    return int(m.group(1)) if m else None
+
+
 def list_audio(batch_dir: Path) -> list[Path]:
-    return sorted(f for f in batch_dir.rglob("*")
-                  if f.is_file() and f.suffix.lower() in ACCEPT_EXT)
+    """Recurse batch_dir (handles nested audios<N>/<ciid>/<ciid>_<q>.wav) and return
+    the audio files to process. Filters to KEEP_QUESTIONS (default {25,26,27});
+    files whose qid can't be parsed are kept (never silently dropped)."""
+    files = sorted(f for f in batch_dir.rglob("*")
+                   if f.is_file() and f.suffix.lower() in ACCEPT_EXT)
+    keep = _keep_questions()
+    if keep is None:
+        return files
+    kept = [f for f in files if (_qid_of(f.stem) is None or _qid_of(f.stem) in keep)]
+    n_drop = len(files) - len(kept)
+    if n_drop:
+        print(f"  KEEP_QUESTIONS={sorted(keep)}: processing {len(kept)} files, "
+              f"skipping {n_drop} (other questions)")
+    return kept
 
 
 def transcribe_batch(audio_files: list[Path], trans_path: Path, model_name: str,

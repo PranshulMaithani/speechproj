@@ -103,6 +103,20 @@ MAX_DURATION_SEC: float | None = 90.0
 CID_QID_RE = re.compile(r"^(.+)_(\d{1,3})$")
 
 
+def _keep_questions() -> set[int] | None:
+    """Which question ids get converted to npy. The per-audio system uses Q25/26/27,
+    so only those become npy (and thus embeddings) -- the rest are skipped. Override
+    with env KEEP_QUESTIONS="all" (keep every question) or e.g. "25,26,27"."""
+    import os
+    raw = os.environ.get("KEEP_QUESTIONS", "25,26,27").strip().lower()
+    if raw in ("", "all", "none"):
+        return None
+    return {int(x) for x in raw.split(",") if x.strip().isdigit()}
+
+
+KEEP_QUESTIONS = _keep_questions()
+
+
 # ----------------------------------------------------------------------------
 # Stats / logging
 # ----------------------------------------------------------------------------
@@ -112,6 +126,7 @@ class PrepStats:
     seen: int = 0
     written: int = 0
     skipped_bad_name: int = 0
+    skipped_other_q: int = 0
     skipped_load_error: int = 0
     skipped_already_done: int = 0
     skipped_dup: int = 0
@@ -335,6 +350,9 @@ def main() -> int:
     log.info("AUDIO_ROOT  = %s", AUDIO_ROOT)
     log.info("OUTPUT_ROOT = %s", OUTPUT_ROOT)
     log.info("TARGET_SR   = %d Hz, MAX_DURATION_SEC = %s", TARGET_SR, MAX_DURATION_SEC)
+    log.info("KEEP_QUESTIONS = %s  (only these qids -> npy -> embeddings; set env "
+             "KEEP_QUESTIONS=all to keep every question)",
+             sorted(KEEP_QUESTIONS) if KEEP_QUESTIONS else "ALL")
 
     if not AUDIO_ROOT.exists():
         log.error("AUDIO_ROOT does not exist: %s", AUDIO_ROOT)
@@ -385,6 +403,10 @@ def main() -> int:
                 log.warning("Could not parse cid/qid from '%s' -- skipping", src.name)
                 continue
             cid, qid = parsed
+            # Only Q25/26/27 (default) become npy -> embeddings; skip the rest.
+            if KEEP_QUESTIONS is not None and qid not in KEEP_QUESTIONS:
+                stats.skipped_other_q += 1
+                continue
             gid = assign_group_id(cid, cid_mapping)
             out_name = f"{gid}_{qid}.npy"
             out_path = npy_dir / out_name
@@ -473,6 +495,7 @@ def main() -> int:
     log.info("seen                   = %d", stats.seen)
     log.info("written                = %d", stats.written)
     log.info("already done (kept)    = %d", stats.skipped_already_done)
+    log.info("skipped (other question)= %d", stats.skipped_other_q)
     log.info("skipped (bad name)     = %d", stats.skipped_bad_name)
     log.info("skipped (load fail)    = %d", stats.skipped_load_error)
     log.info("skipped (duplicates)   = %d", stats.skipped_dup)

@@ -24,6 +24,10 @@ transcribe_device: cpu                    # cpu | cuda   (cuda = faster transcri
 transcribe_compute_type: int8             # faster-whisper compute type (cuda: float16)
 transcribe_model: ""                      # "" keeps the SAME model as audios2..6 (feature parity)
 retranscribe: false                       # re-transcribe every discovered batch (--force)
+# Nested batches arrive as audios<N>/<ciid>/<ciid>_<q>.wav for q=1..27; the system
+# only uses Q25/26/27. keep_questions filters to those (-> npy -> embeddings).
+keep_questions: "25,26,27"                # only these qids are processed ("all" = every question)
+prune_questions: false                    # DELETE the non-kept wavs to save space (IRREVERSIBLE)
 
 # ---- Stage 0: WavLM/Whisper embedding extraction (guarded, incremental) ------
 do_extract: auto                          # auto | true | false

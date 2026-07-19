@@ -14,8 +14,22 @@ only `.npy` + `gt.csv` move downstream. Raw wavs never move.
 ## Where to put your data (modular — no code edits to add a batch)
 Drop, side by side, **inside `companylaptop/`** (or set `audio_root`):
 ```
-companylaptop/audios<N>/<realCID>_<qid>.wav     ← raw audio, flat folder
+companylaptop/audios<N>/<ciid>/<ciid>_<q>.wav   ← raw audio (nested per-candidate, q=1..27)
 companylaptop/audios<N>GT.csv                   ← columns: filename,label[,region]
+```
+Both flat (`audios<N>/<cid>_<q>.wav`) and nested (`audios<N>/<ciid>/<ciid>_<q>.wav`) layouts
+work — the scripts recurse. The GT `filename` is the basename (e.g. `ciid_25.wav`).
+
+**Question filter (only Q25/26/27):** the per-audio system uses questions 25/26/27, so
+`keep_questions` (default `"25,26,27"`) makes **only those become npy → embeddings**; other
+questions are skipped (not transcribed, not encoded). Set `keep_questions: all` to keep every
+question.
+
+**Prune to save space (optional, irreversible):** `prune_questions: true` **deletes** every
+non-kept wav before transcription. Preview first with the standalone tool (dry-run by default):
+```bash
+python companylaptop/prune_questions.py --batch audios8            # preview (deletes nothing)
+python companylaptop/prune_questions.py --batch audios8 --apply    # actually delete
 ```
 `label`: `read/cheating/scripted/yes/1` → **1**; `spontaneous/genuine/no/0` → **0**.
 Stage I auto-discovers any `audios<N>/` that has a matching `<batch>GT.csv`, so adding
@@ -52,6 +66,8 @@ Config via a YAML job file (`--config`); any CLI flag overrides it. Sample:
 | `transcribe_compute_type` | `int8` | faster-whisper compute type (cuda: `float16`) |
 | `transcribe_model` | `""` | override transcription model — **leave empty** to keep feature parity with audios2..6 |
 | `retranscribe` | `false` | re-transcribe every discovered batch (`--force`) |
+| `keep_questions` | `"25,26,27"` | only these question ids become npy → embeddings (`all` = every question) |
+| `prune_questions` | `false` | **delete** the non-kept wavs before transcription (IRREVERSIBLE; opt-in) |
 
 **Paths / embeddings**
 | Key | Default | Meaning |
