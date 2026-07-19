@@ -166,4 +166,21 @@ python ec2/neural_baseline_train.py --data_dir <UP> --cache <CACHE> --out_dir <R
 `default_last_pca98` from the first run = Model 1; `tiny_l9_pca95` from the second = Model 2.
 Every other variant is also frozen and pickable — see `RUNBOOK.md` "Picking a model".
 
+## Notes & gotchas
+- **`neural_baseline_train.py` has NO `--variants` flag** — it always trains the full
+  30-variant sweep with one global seed (that's what reproduces the finalised numbers). With
+  `--export_artifacts true` it exports **every** variant's bundle into `<out_dir>/<variant>/`,
+  so you pick the model afterwards (any variant is usable — see `RUNBOOK.md` "Picking a model").
+- **`--train_only_batches` rows are appended AFTER the split** (M1's `casual`, ALLSTAR
+  `2676,2677`) so they can never leak into val/test.
+- **`--min_duration 30`** and **`--use_augs all`** are part of the finalised recipe — keep them
+  to reproduce M1/M2.
+- **Cache model-ID stamp:** `extract_embeddings.py` refuses to append if the passed
+  `--wavlm_id/--whisper_id` differ from what's stored (no mixing 768-d base with 1024-d large).
+  Keep base/large caches at separate `--out_path`s. See `COMMANDS_CACHE_FIX.txt`.
+- **`neural_baseline_prep.py` has no CLI** — it's driven by module constants + the env vars
+  `KEEP_QUESTIONS` / `PREP_AUDIO_ROOT` / `PREP_UPLOAD_DIR` / `PREP_LOCAL_DIR` (above).
+- **`--test_batches ""`** = 20pct; **`--test_batches audios6`** = a6. `--fewshot_frac` (a6 only)
+  carves a slice of the test client into train.
+
 *See also: `RUNBOOK.md` (chronological), `COMMANDS_ADD_BATCH.txt`, `COMMANDS_ANALYSIS.txt`.*

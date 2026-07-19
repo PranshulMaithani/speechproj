@@ -77,4 +77,20 @@ Any variant a training run produced is a drop-in — copy its whole bundle to a 
 (e.g. `data/runs/finalised/<variant>/`) and point `--models_root` at it. See `RUNBOOK.md`
 "Picking a model" for the selection guidance (match capacity to in-domain vs cross-client).
 
-*See also: `REF_TRAIN_uniscript.md`, `RUNBOOK.md` Part B.*
+## Notes & gotchas
+- **`--models_root` is a recursive folder search**, not a file — it scores every folder with
+  `model.pt + inference_meta.json`. Point it at one folder to score one model, or filter a
+  shared root with `--models "<substring>"`.
+- **Bundle must be complete:** `model.pt`, `scaler.joblib`, `inference_meta.json`, **and
+  `pca.joblib` if the model used PCA**. Move the whole folder as a unit — never mix a `model.pt`
+  with another run's scaler/PCA.
+- **`in_dim` is enforced** — if the rebuilt features don't match `inference_meta.json`, it
+  errors rather than silently mispredicting (catches cache / feature-order mismatches).
+- **Own-test mode** verifies the reload reproduces the saved `pred_score`; **`--test_batch`**
+  scores fresh held-out data (needs labels in `gt.csv` for the metrics).
+- **`--threshold`** only *records* a decision column; it doesn't change the metrics. Weights
+  transfer across data, the F1-optimal threshold may not (re-tune on the target data).
+- For **label-free scoring** of raw audio (probabilities + a fixed `threshold.txt`, no gt),
+  use `inference/run_inference.py` (`REF_INFERENCE.md`) instead.
+
+*See also: `REF_TRAIN_uniscript.md`, `RUNBOOK.md` Part B, `REF_INFERENCE.md`.*

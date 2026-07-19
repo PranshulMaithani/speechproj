@@ -135,4 +135,23 @@ python ec2/train_pipeline.py --config ec2/configs/train_job.example.yaml \
 python ec2/train_pipeline.py --ingest false --do_extract false --out_dir ...
 ```
 
+## Notes & gotchas
+- **Every config key is a CLI flag** (`--<key>`), and CLI overrides the YAML. They take a
+  **value**, not a bare switch: `--prune_questions true`, `--ingest false`,
+  `--keep_questions 25,26,27` (booleans accept `true/1/yes`).
+- **`ingest: auto`** runs Stage I only if a discovered batch is new (absent from `gt.csv`) or
+  missing its `_features.csv`; with **no** `audios<N>/` under `audio_root` it silently skips —
+  so the same script is safe as a pure train-from-cache run.
+- **`do_extract: auto`** extracts embeddings only if audio is present *and* something's missing;
+  on EC2 (no audio) it skips and uses the cache. `false` forces train-from-cache.
+- **`prune_questions: true` is irreversible** — it deletes non-kept wavs. Preview first with
+  `companylaptop/prune_questions.py` (dry-run) before enabling it in a run.
+- **`audio_root` defaults to `data_dir`** — raw audios live with the npy; prep writes
+  `gt.csv` + `audio_npy/` back into `data_dir`, and `cid_mapping.json` stays under
+  `data_dir/local/` (never uploaded).
+- **`variants`**: `all` = the 30-variant sweep; `grid` = the `archs × layers × pca` you list;
+  or an explicit list of variant names to freeze exactly those.
+- **`transcribe_model` must stay `""`** for feature parity with audios2..6 — changing the
+  transcription model shifts the 55 features.
+
 *See also: `RUNBOOK.md` Part B, `METHODOLOGY.md`, `EMBEDDING_EXTRACTION.md`.*

@@ -36,6 +36,11 @@ numbers + encoded waveforms are uploaded. **No cloud script ever reads a wav or 
 | `COMMANDS_AUG_SAMPLES.txt` | augmentation ablation sample commands |
 | `METHODOLOGY.md` | what the system is + the two finalised models |
 | `EMBEDDING_EXTRACTION.md` | how WavLM/Whisper embeddings are produced |
+| `docs/REF_TRAIN_multiscript.md` | every flag of the legacy training scripts |
+| `docs/REF_TRAIN_uniscript.md` | every config key of `train_pipeline.py` (unified) |
+| `docs/REF_EVAL_selected_models.md` | every flag of `evaluate_final_models.py` |
+| `docs/REF_EVAL_uniscript.md` | every flag of `evaluate_models.py` |
+| `docs/REF_INFERENCE.md` | every flag of `inference/run_inference.py` |
 
 ### The two finalised models (the target of the whole pipeline)
 - **Model 1** = `default_last_pca98` **+ casual**, on the **20pct** split → run dir `m1_casual_20pct`.
@@ -253,6 +258,28 @@ python ec2/evaluate_models.py \
 Outputs: `per_model/<id>/{predictions.csv, threshold_sweep.csv, metrics.json}`,
 `eval_summary.csv`, `eval_summary.xlsx`. Use `--threshold` to also record a chosen operating
 threshold per row.
+
+---
+
+# PART C — Inference (label-free scoring of raw audio)
+
+For scoring raw audio with chosen models (no labels, a fixed threshold per model), use the
+self-contained inference system. Full detail: `docs/REF_INFERENCE.md`.
+
+```bash
+# 1. put audio under inference/audios/<any-name>/  (recurses; scores only *_25/_26/_27)
+# 2. put each model's bundle under inference/models/<any-name>/ :
+#      model.pt  scaler.joblib  inference_meta.json  threshold.txt  [pca.joblib]
+# 3. run:
+python inference/run_inference.py                                  # CPU transcription
+python inference/run_inference.py --transcribe_device cuda --transcribe_compute_type float16
+```
+It runs the whole chain (wav → npy → transcript → 55 features → WavLM+Whisper embeddings →
+scaler → pca → MLP → sigmoid), applies each model's `threshold.txt`
+(**prob ≥ threshold → CHEAT**), and writes `inference/results/inference_results.xlsx` — a
+`summary` sheet + one sheet per model (audio_group, audio_name, question, path, probability,
+threshold, result, decision). Distinct from `evaluate_models.py`, which needs labels and
+reports metrics; this is pure prediction.
 
 ---
 

@@ -70,4 +70,15 @@ python ec2/evaluate_final_models.py \
   precision (recall@precision is the headline operating point). Remember the cross-client
   **threshold-transfer caveat**: re-tune the threshold on the target data.
 
+## Notes & gotchas
+- **Hardwired to the two finalised variants** (`default_last_pca98`, `tiny_l9_pca95`). To score
+  *any other* variant, use `evaluate_models.py` (`REF_EVAL_uniscript.md`).
+- Needs the **exported bundles** — run training with `--export_artifacts true` first, or the
+  run dirs won't have `model.pt`/`scaler`/`pca`.
+- **Own-test mode verifies reproduction** (`repro_max_abs_diff < 1e-3` ⇒ the reloaded weights
+  match the saved predictions). A large diff means a cache/feature-order mismatch.
+- **`--test_batch` needs the same base cache** the models trained on (dims are checked).
+- **Threshold transfer caveat:** `best_f1` uses a threshold swept on *this* data; on a new
+  client the F1-optimal threshold shifts — read the `_sweep` sheet at your target precision.
+
 *See also: `RUNBOOK.md` Stage 4, `METHODOLOGY.md` §6.*
